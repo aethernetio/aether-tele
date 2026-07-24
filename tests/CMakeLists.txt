@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+cmake_minimum_required( VERSION 3.16 )
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/CPM.cmake)
 
 CPMAddPackage(
-  NAME unity
+  NAME Unity
   GITHUB_REPOSITORY ThrowTheSwitch/Unity
   GIT_TAG master
 )
