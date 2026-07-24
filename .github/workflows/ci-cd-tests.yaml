@@ -1,0 +1,109 @@
+name: CMake
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.config.name }}
+    runs-on: ${{ matrix.config.os }}
+    defaults:
+      run:
+        shell: ${{ matrix.config.shell }}
+
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {
+              name: "Windows MSVC x64",
+              os: windows-latest,
+              shell: cmd,
+              generator: "Visual Studio 18 2026",
+              arch: "x64",
+              cc: "cl",
+              cxx: "cl",
+            }
+          - {
+              name: "Windows MSVC x86",
+              os: windows-latest,
+              shell: cmd,
+              generator: "Visual Studio 18 2026",
+              arch: "Win32",
+              cc: "cl",
+              cxx: "cl",
+            }
+          - {
+              name: "Windows MinGW",
+              os: windows-latest,
+              shell: "msys2 {0}",
+              generator: "Ninja",
+              arch: "",
+              cc: "gcc",
+              cxx: "g++",
+            }
+          - {
+              name: "Ubuntu GCC",
+              os: ubuntu-latest,
+              shell: bash,
+              generator: "Unix Makefiles",
+              arch: "",
+              cc: "gcc",
+              cxx: "g++",
+              jobs_count: 4,
+            }
+          - {
+              name: "macOS Clang",
+              os: macos-latest,
+              shell: bash,
+              generator: "Unix Makefiles",
+              arch: "",
+              cc: "clang",
+              cxx: "clang++",
+              jobs_count: 4,
+            }
+
+    steps:
+      - name: Set Windows environment
+        if: ${{ (matrix.config.os == 'windows-latest' && matrix.config.cc == 'cl') }}
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Set MinGW environment
+        if: ${{ (matrix.config.os == 'windows-latest' && matrix.config.cc == 'gcc') }}
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: >-
+            git
+            base-devel
+          pacboy: >-
+            cmake:p
+            ninja:p
+            gcc:p
+          update: true
+
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Configure CMake
+        run: >
+          cmake -B build
+          -G "${{ matrix.config.generator }}"
+          -A "${{ matrix.config.arch }}"
+          -DCMAKE_CXX_COMPILER=${{ matrix.config.cxx }}
+          -DCMAKE_C_COMPILER=${{ matrix.config.cc }}
+          -DCMAKE_BUILD_TYPE=Release
+          -DAE_TELE_BUILD_TESTS=ON
+          -DAE_TELE_INSTALL=OFF
+          -S ./
+
+      - name: Build
+        run: cmake --build build --config Release --parallel ${{ matrix.config.jobs_count }}
+
+      - name: Test
+        run: ctest --test-dir build --build-config Release --output-on-failure --parallel
