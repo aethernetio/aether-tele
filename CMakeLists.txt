@@ -68,7 +68,6 @@ target_compile_options(aether-tele PUBLIC
   $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>
 )
 target_link_libraries(aether-tele PUBLIC aether-miscpp numeric)
-target_compile_definitions(aether-tele PUBLIC AE_PROJECT_VERSION="${PROJECT_VERSION}")
 
 if(AE_TELE_BUILD_TESTS)
   enable_testing()
