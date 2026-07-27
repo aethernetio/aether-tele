@@ -12,10 +12,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+cmake_minimum_required( VERSION 3.16 )
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
 include(${CMAKE_CURRENT_LIST_DIR}/../cmake/CPM.cmake)
 
 CPMAddPackage(
-  NAME unity
+  NAME Unity
   GITHUB_REPOSITORY ThrowTheSwitch/Unity
   GIT_TAG master
 )
@@ -33,5 +38,6 @@ target_link_libraries(test-tele PRIVATE aether::tele unity)
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   target_compile_options(test-tele PUBLIC /Zc:preprocessor)
 endif()
+target_compile_definitions(test-tele PUBLIC AE_PROJECT_VERSION="1.2.3")
 
 add_test(NAME test-tele COMMAND $<TARGET_FILE:test-tele>)

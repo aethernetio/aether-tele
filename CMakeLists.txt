@@ -39,7 +39,6 @@ CPMAddPackage(
     "AE_NUMERIC_INSTALL ${AE_TELE_INSTALL}"
     "AE_BUILD_TESTS OFF"
 )
-
 CPMAddPackage(
   NAME aether-miscpp
   GITHUB_REPOSITORY aethernetio/aether-miscpp
@@ -68,7 +67,61 @@ target_compile_options(aether-tele PUBLIC
   $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>
 )
 target_link_libraries(aether-tele PUBLIC aether-miscpp numeric)
-target_compile_definitions(aether-tele PUBLIC AE_PROJECT_VERSION="${PROJECT_VERSION}")
+
+# setup release build options
+if (CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT MINGW)
+  target_compile_options(aether-tele
+    PUBLIC
+    $<$<CXX_COMPILER_ID:GNU,CLang>:
+        -ffast-math
+        -fno-math-errno
+        -funsafe-math-optimizations
+        -fassociative-math
+        -freciprocal-math
+        -ffinite-math-only
+        -fno-signed-zeros
+        -fno-trapping-math
+
+        $<$<COMPILE_LANGUAGE:CXX>:-fno-rtti>
+    >
+    # GNU only, clang does not support this
+    $<$<CXX_COMPILER_ID:GNU>:
+        -fsingle-precision-constant
+        -fno-fp-int-builtin-inexact
+      >
+    PRIVATE
+    # TODO: make this options configurable from user side
+    $<$<CXX_COMPILER_ID:GNU,CLang>:$<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>>
+  )
+
+
+  if (GCC_VERSION VERSION_GREATER 12.1 OR GCC_VERSION VERSION_EQUAL 12.1)
+    target_compile_options(aether-tele PUBLIC -Oz -DNDEBUG)
+  else()
+    target_compile_options(aether-tele PUBLIC -Os -DNDEBUG)
+  endif()
+
+
+  # size optimizations
+  target_compile_options(aether-tele
+    PUBLIC
+    $<$<CXX_COMPILER_ID:GNU,CLang>:
+      -fdata-sections
+      -ffunction-sections
+      -flto=auto
+      -ffat-lto-objects
+    >
+  )
+  target_link_options(aether-tele
+    PUBLIC
+    $<$<CXX_COMPILER_ID:GNU,CLang>:
+      -fdata-sections
+      -ffunction-sections
+      -flto=auto
+      -Wl,--gc-sections,--strip-all
+    >
+  )
+endif()
 
 if(AE_TELE_BUILD_TESTS)
   enable_testing()
