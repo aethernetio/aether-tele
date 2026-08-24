@@ -31,14 +31,17 @@ option(AE_TELE_INSTALL "Install aether-tele library" ${IS_ROOT_PROJECT})
 include(GNUInstallDirs)
 include(cmake/CPM.cmake)
 
-CPMAddPackage(
-  NAME numeric
-  GITHUB_REPOSITORY aethernetio/aethernet-numeric
-  GIT_TAG main
-  OPTIONS
-    "AE_NUMERIC_INSTALL ${AE_TELE_INSTALL}"
-    "AE_BUILD_TESTS OFF"
-)
+# Prefer parent-provided ae-numeric when aether-tele is a CPM dependency.
+if(NOT TARGET ae-numeric)
+  CPMAddPackage(
+    NAME ae-numeric
+    GITHUB_REPOSITORY aethernetio/aethernet-numeric
+    GIT_TAG b82a3674a119f4e8257b17c0f7cf592ce7ad48c0
+    OPTIONS
+      "AE_NUMERIC_INSTALL ${AE_TELE_INSTALL}"
+      "AE_BUILD_TESTS OFF"
+  )
+endif()
 CPMAddPackage(
   NAME aether-miscpp
   GITHUB_REPOSITORY aethernetio/aether-miscpp
@@ -66,7 +69,12 @@ target_compile_features(aether-tele PUBLIC cxx_std_20)
 target_compile_options(aether-tele PUBLIC
   $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>
 )
-target_link_libraries(aether-tele PUBLIC aether-miscpp numeric)
+target_link_libraries(aether-tele PUBLIC aether-miscpp ae-numeric)
+# ae-numeric TieredInt has an intentional post-if-constexpr fallback that MSVC
+# may flag as C4702 under /WX consumers.
+if(MSVC)
+  target_compile_options(aether-tele PUBLIC /wd4702)
+endif()
 
 # setup release build options
 if (CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT MINGW)
