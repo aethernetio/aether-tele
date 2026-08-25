@@ -23,12 +23,10 @@
 
 namespace ae::tele {
 
-// Legacy TieredInt<std::uint64_t, std::uint8_t, 250> wire encoding used for
-// metric indices/counts. Byte-compatible with Aether PackedSize framing.
+// Compact integer encoding for metric indices and invocation counts.
 using PackedU64 = TieredInt<std::uint8_t, 250, 1514, 1049834>;
 
-// Legacy TieredInt<std::uint32_t, std::uint8_t, 250> wire encoding used for
-// compile-option indices (three tiers: 1/2/4 bytes).
+// Compact integer encoding for compile-option indices.
 using PackedU32 = TieredInt<std::uint8_t, 250, 1514>;
 
 }  // namespace ae::tele

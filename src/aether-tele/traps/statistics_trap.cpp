@@ -87,8 +87,7 @@ StatisticsTrapBasic::~StatisticsTrapBasic() = default;
 void StatisticsTrapBasic::AddInvoke(Tag const& tag, std::uint32_t count) {
   auto lock = std::scoped_lock(sync_lock_);
   auto& invocations = metrics_store_.metrics[tag.index()].invocations_count;
-  invocations = MetricsStore::PackedCount{
-      static_cast<MetricsStore::PackedCount::ValueType>(invocations) + count};
+  invocations += count;
 }
 
 void StatisticsTrapBasic::AddInvokeDuration(Tag const& tag, Duration duration) {
@@ -132,11 +131,7 @@ void StatisticsTrapBasic::MergeStatistics(StatisticsTrapBasic const& newer) {
       metrics_store_.metrics[index] = metric;
       continue;
     }
-    it->second.invocations_count = MetricsStore::PackedCount{
-        static_cast<MetricsStore::PackedCount::ValueType>(
-            it->second.invocations_count) +
-        static_cast<MetricsStore::PackedCount::ValueType>(
-            metric.invocations_count)};
+    it->second.invocations_count += metric.invocations_count;
     it->second.max_duration =
         std::max(it->second.max_duration, metric.max_duration);
     it->second.min_duration =
