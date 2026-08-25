@@ -32,9 +32,9 @@ include(GNUInstallDirs)
 include(cmake/CPM.cmake)
 
 CPMAddPackage(
-  NAME numeric
+  NAME ae-numeric
   GITHUB_REPOSITORY aethernetio/aethernet-numeric
-  GIT_TAG main
+  GIT_TAG 68fcbb3d7975adddf2be5fae4c8c22ef725da5e7
   OPTIONS
     "AE_NUMERIC_INSTALL ${AE_TELE_INSTALL}"
     "AE_BUILD_TESTS OFF"
@@ -66,7 +66,7 @@ target_compile_features(aether-tele PUBLIC cxx_std_20)
 target_compile_options(aether-tele PUBLIC
   $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>
 )
-target_link_libraries(aether-tele PUBLIC aether-miscpp numeric)
+target_link_libraries(aether-tele PUBLIC aether-miscpp ae-numeric)
 
 # setup release build options
 if (CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT MINGW)

@@ -106,6 +106,8 @@ void test_SaveLoadTeleStatistics();
 void test_IoStreamTrapFullOutput();
 void test_IoStreamTrapLocationWithoutSeparatorUsesUnknownFile();
 void test_EnvTele();
+void test_PackedU64WireGolden();
+void test_PackedU32WireGolden();
 
 }  // namespace ae::tele::test_tele
 

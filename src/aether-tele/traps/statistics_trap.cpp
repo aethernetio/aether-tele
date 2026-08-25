@@ -18,9 +18,13 @@
 #include "aether-tele/traps/statistics_trap.h"
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <cstdint>
 #include <iterator>
 #include <utility>
+
+#include "ae-numeric/wire_io.h"
 
 namespace ae::tele {
 
@@ -32,26 +36,11 @@ ILogStorage& operator<<(ILogStorage& out, T v) {
   return out;
 }
 
-template <typename T>
-concept IndexSerializable = requires(ILogStorage& log_storage, T const t) {
-  { t.Serialize(log_storage) };
-};
-
-template <typename T>
-concept IndexBuffSerializable = requires(std::uint8_t* buf, T const t) {
-  { t.Serialize(buf) } -> std::same_as<std::size_t>;
-};
-
-template <typename T>
-  requires(IndexSerializable<T> || IndexBuffSerializable<T>)
+template <WireSerializable T>
 void WriteIndex(ILogStorage& log_storage, T const& v) {
-  if constexpr (IndexSerializable<T>) {
-    v.Serialize(log_storage);
-  } else {
-    std::array<std::uint8_t, sizeof(std::uint64_t)> buff;
-    auto s = v.Serialize(buff.data());
-    log_storage.Write(buff.data(), s);
-  }
+  std::array<std::uint8_t, MaxWireBytes<T>()> buff{};
+  auto const s = ae::Serialize(v, buff.data());
+  log_storage.Write(buff.data(), s);
 }
 
 StatisticsTrapBasic::LogLineWriter::LogLineWriter(Tag const& tag,
@@ -97,7 +86,8 @@ StatisticsTrapBasic::~StatisticsTrapBasic() = default;
 
 void StatisticsTrapBasic::AddInvoke(Tag const& tag, std::uint32_t count) {
   auto lock = std::scoped_lock(sync_lock_);
-  metrics_store_.metrics[tag.index()].invocations_count += count;
+  auto& invocations = metrics_store_.metrics[tag.index()].invocations_count;
+  invocations += count;
 }
 
 void StatisticsTrapBasic::AddInvokeDuration(Tag const& tag, Duration duration) {

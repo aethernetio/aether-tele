@@ -32,7 +32,8 @@ add_executable(test-tele
   test-tele-config.cpp
   test-tele-traps.cpp
   test-tele-iostream.cpp
-  test-tele-env.cpp)
+  test-tele-env.cpp
+  test-tiered-int-wire.cpp)
 target_link_libraries(test-tele PRIVATE aether::tele unity)
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")

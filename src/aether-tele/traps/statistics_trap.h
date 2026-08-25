@@ -29,17 +29,17 @@
 #include <vector>
 
 #include "aether-miscpp/reflect/reflect.h"
-#include "numeric/tiered_int.h"
 
 #include "aether-tele/itrap.h"
+#include "aether-tele/packed_int.h"
 
 namespace ae::tele {
 /**
  * \brief Map of telemetry metrics.
  */
 struct MetricsStore {
-  using PackedIndex = TieredInt<std::uint64_t, std::uint8_t, 250>;
-  using PackedCount = TieredInt<std::uint64_t, std::uint8_t, 250>;
+  using PackedIndex = PackedU64;
+  using PackedCount = PackedU64;
   struct Metric {
     PackedCount invocations_count;
     std::uint32_t max_duration;
@@ -62,7 +62,7 @@ struct MetricsStore {
  * of the application.
  */
 struct EnvStore {
-  using PackedIndex = TieredInt<std::uint32_t, std::uint8_t, 250>;
+  using PackedIndex = PackedU32;
 
   std::string library_version;
   std::string platform;

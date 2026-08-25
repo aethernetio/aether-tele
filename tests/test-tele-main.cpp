@@ -31,5 +31,7 @@ int main() {
   RUN_TEST(ae::tele::test_tele::
                test_IoStreamTrapLocationWithoutSeparatorUsesUnknownFile);
   RUN_TEST(ae::tele::test_tele::test_EnvTele);
+  RUN_TEST(ae::tele::test_tele::test_PackedU64WireGolden);
+  RUN_TEST(ae::tele::test_tele::test_PackedU32WireGolden);
   return UNITY_END();
 }
