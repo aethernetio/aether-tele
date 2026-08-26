@@ -33,5 +33,15 @@ int main() {
   RUN_TEST(ae::tele::test_tele::test_EnvTele);
   RUN_TEST(ae::tele::test_tele::test_PackedU64WireGolden);
   RUN_TEST(ae::tele::test_tele::test_PackedU32WireGolden);
+  RUN_TEST(ae::tele::test_tele::test_SpaceChecksumIsUint32CompileTime);
+  RUN_TEST(ae::tele::test_tele::test_SpaceIndexChangeChangesChecksum);
+  RUN_TEST(ae::tele::test_tele::test_TwoSpacesIndependentSameIndex);
+  RUN_TEST(ae::tele::test_tele::test_ExactDeltaAndCountRoundTrip);
+  RUN_TEST(ae::tele::test_tele::test_BareUntimedRecordCanBeOneByte);
+  RUN_TEST(ae::tele::test_tele::test_DisabledModuleCreatesNoData);
+  RUN_TEST(ae::tele::test_tele::test_BinaryOmitsPresentationStrings);
+  RUN_TEST(ae::tele::test_tele::test_RuntimeCountTypesAndDurationScope);
+  RUN_TEST(ae::tele::test_tele::test_UserFreezeAndSwapAndSingleStorage);
+  RUN_TEST(ae::tele::test_tele::test_OldBlobRejectedByAlteredSchema);
   return UNITY_END();
 }

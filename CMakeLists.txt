@@ -68,6 +68,24 @@ target_compile_options(aether-tele PUBLIC
 )
 target_link_libraries(aether-tele PUBLIC aether-miscpp ae-numeric)
 
+set(AE_TELE_GIT "")
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(
+    COMMAND ${GIT_EXECUTABLE} rev-parse --short HEAD
+    WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
+    OUTPUT_VARIABLE AE_TELE_GIT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    ERROR_QUIET
+  )
+endif()
+target_compile_definitions(aether-tele PUBLIC AE_PROJECT_VERSION="${PROJECT_VERSION}")
+if(AE_TELE_GIT)
+  target_compile_definitions(aether-tele PUBLIC AE_GIT_VERSION="${AE_TELE_GIT}")
+endif()
+
+option(AE_TELE_BUILD_EXAMPLES "Build aether-tele examples" ${IS_ROOT_PROJECT})
+
 # setup release build options
 if (CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT MINGW)
   target_compile_options(aether-tele
@@ -123,9 +141,16 @@ if (CMAKE_BUILD_TYPE STREQUAL "Release" AND NOT MINGW)
   )
 endif()
 
-if(AE_TELE_BUILD_TESTS)
+if(AE_TELE_BUILD_TESTS OR AE_TELE_BUILD_EXAMPLES)
   enable_testing()
+endif()
+
+if(AE_TELE_BUILD_TESTS)
   add_subdirectory(tests)
+endif()
+
+if(AE_TELE_BUILD_EXAMPLES)
+  # Superseded by tests/space_standalone (revised space API).
 endif()
 
 if(AE_TELE_INSTALL)

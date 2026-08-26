@@ -43,12 +43,15 @@
 AE_TELE_MODULE(MLog, AE_LOG_MODULE, AE_LOG_MODULE, AE_LOG_MODULE);
 AE_TAG(kLog, MLog)
 
-#define AE_TELE_(TAG_NAME, TAG, LEVEL, ...)                                   \
+#define AE_TELE_WITH_SINK(SINK, TAG_NAME, TAG, LEVEL, ...)                    \
   [[maybe_unused]] auto TAG_NAME = ::ae::tele::Tele<                          \
-      TELE_SINK, TELE_SINK::template GetTeleConfig<LEVEL, TAG.module.id>()> { \
-    TELE_SINK::Instance(), TAG, ::ae::tele::Level{LEVEL}, __FILE__, __LINE__, \
+      SINK, SINK::template GetTeleConfig<LEVEL, TAG.module.id>()> {           \
+    SINK::Instance(), TAG, ::ae::tele::Level{LEVEL}, __FILE__, __LINE__,      \
         __VA_ARGS__                                                           \
   }
+
+#define AE_TELE_(TAG_NAME, TAG, LEVEL, ...) \
+  AE_TELE_WITH_SINK(TELE_SINK, TAG_NAME, TAG, LEVEL, __VA_ARGS__)
 
 #define AE_TELE_DEBUG(TAG, ...) \
   AE_TELE_(AETE_UNIQUE_NAME(TELE_), TAG, ::ae::tele::Level::kDebug, __VA_ARGS__)

@@ -108,6 +108,16 @@ void test_IoStreamTrapLocationWithoutSeparatorUsesUnknownFile();
 void test_EnvTele();
 void test_PackedU64WireGolden();
 void test_PackedU32WireGolden();
+void test_SpaceChecksumIsUint32CompileTime();
+void test_SpaceIndexChangeChangesChecksum();
+void test_TwoSpacesIndependentSameIndex();
+void test_ExactDeltaAndCountRoundTrip();
+void test_BareUntimedRecordCanBeOneByte();
+void test_DisabledModuleCreatesNoData();
+void test_BinaryOmitsPresentationStrings();
+void test_RuntimeCountTypesAndDurationScope();
+void test_UserFreezeAndSwapAndSingleStorage();
+void test_OldBlobRejectedByAlteredSchema();
 
 }  // namespace ae::tele::test_tele
 
