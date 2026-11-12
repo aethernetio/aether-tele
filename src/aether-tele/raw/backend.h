@@ -37,6 +37,10 @@ inline bool BackendCallbackActive() noexcept {
 class IBackend {
  public:
   virtual ~IBackend() = default;
+  // Optional process-local capability token. A backend may expose a stable
+  // per-type address so callers can validate a static cast without RTTI.
+  // nullptr means that no checked concrete-type capability is advertised.
+  virtual void const* TypeToken() const noexcept { return nullptr; }
   virtual bool Append(std::string_view space,
                       std::span<std::uint8_t const> bytes) = 0;
   virtual bool RestoreMetrics(std::string_view space, std::uint32_t writer,

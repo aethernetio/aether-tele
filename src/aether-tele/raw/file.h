@@ -94,7 +94,9 @@ class BasicFileDrain {
     recovery_.directory_sync_supported = Backend::kDirectorySyncSupported;
     size_ = 0;
     std::error_code error;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       if (!backend_.Open(path, error))
         return OpenFailure(FileError::kOpen, error);
       if (!backend_.Size(recovery_.original_size, error))
@@ -131,6 +133,7 @@ class BasicFileDrain {
       state_ = FileState::kReady;
       status_ = {};
       return true;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (std::bad_alloc const&) {
       if (state_ != FileState::kPoisoned) CloseBackend();
       return Fail(FileError::kMemory,
@@ -139,6 +142,7 @@ class BasicFileDrain {
       if (state_ != FileState::kPoisoned) CloseBackend();
       return Fail(FileError::kOpen, std::make_error_code(std::errc::io_error));
     }
+#endif
   }
 
   // Call on each new, quiescent Stream before starting its writer. A stable
@@ -168,7 +172,9 @@ class BasicFileDrain {
     if (state_ != FileState::kReady) return fail(FileError::kNotOpen);
     std::error_code error;
     std::uint64_t offset = 0;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       std::uint64_t actual{};
       if (!backend_.Size(actual, error)) return fail(FileError::kSize, error);
       if (actual != size_) {
@@ -211,6 +217,7 @@ class BasicFileDrain {
         return fail(FileError::kRestoreState);
       status_ = {};
       return finish(true);
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (std::bad_alloc const&) {
       return fail(FileError::kMemory,
                   std::make_error_code(std::errc::not_enough_memory), offset);
@@ -218,6 +225,7 @@ class BasicFileDrain {
       return fail(FileError::kRead, std::make_error_code(std::errc::io_error),
                   offset);
     }
+#endif
   }
 
   // Serialize complete batches from different owner streams. The optional
@@ -239,8 +247,11 @@ class BasicFileDrain {
     }
     if (state_ != FileState::kReady) return finish(Fail(FileError::kNotOpen));
     auto const checkpoint = size_;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       if (!Validate(bytes)) return finish(false);
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (std::bad_alloc const&) {
       return finish(Fail(FileError::kMemory,
                          std::make_error_code(std::errc::not_enough_memory),
@@ -248,6 +259,7 @@ class BasicFileDrain {
     } catch (...) {
       return finish(Fail(FileError::kInvalidInput, {}, checkpoint));
     }
+#endif
     if (bytes.empty()) {
       status_ = {};
       return finish(true);
@@ -255,7 +267,9 @@ class BasicFileDrain {
     if (bytes.size() > std::numeric_limits<std::uint64_t>::max() - checkpoint)
       return finish(Fail(FileError::kInvalidInput, {}, checkpoint));
     std::error_code error;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       std::uint64_t actual{};
       if (!backend_.Size(actual, error))
         return finish(Fail(FileError::kSize, error, checkpoint));
@@ -263,13 +277,17 @@ class BasicFileDrain {
         state_ = FileState::kPoisoned;
         return finish(Fail(FileError::kExternalChange, {}, checkpoint));
       }
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       return finish(Fail(FileError::kSize,
                          std::make_error_code(std::errc::io_error),
                          checkpoint));
     }
+#endif
     FileError failure = FileError::kWrite;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       std::size_t done = 0;
       while (done < bytes.size()) {
         std::size_t written{};
@@ -289,19 +307,24 @@ class BasicFileDrain {
       size_ = checkpoint + bytes.size();
       status_ = {};
       return finish(true);
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       return finish(Rollback(checkpoint, failure,
                              std::make_error_code(std::errc::io_error)));
     }
+#endif
   }
 
   bool Close() noexcept {
     std::lock_guard lock(mutex_);
     std::error_code error;
     bool success = false;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       if (!backend_.IsOpen()) return state_ != FileState::kPoisoned;
       success = backend_.Close(error);
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       error = std::make_error_code(std::errc::io_error);
       if (state_ != FileState::kPoisoned) {
@@ -309,6 +332,7 @@ class BasicFileDrain {
         return Fail(FileError::kClose, error, size_);
       }
     }
+#endif
     if (state_ == FileState::kPoisoned) return success;
     state_ = FileState::kClosed;
     if (!success) return Fail(FileError::kClose, error, size_);
@@ -345,10 +369,14 @@ class BasicFileDrain {
   }
   void CloseBackend() noexcept {
     std::error_code ignored;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       backend_.Close(ignored);
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
     }
+#endif
     state_ = FileState::kClosed;
   }
   bool OpenFailure(FileError code, std::error_code error = {},
@@ -440,12 +468,16 @@ class BasicFileDrain {
                 std::error_code error) noexcept {
     std::error_code rollback;
     bool restored = false;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       restored =
           backend_.Truncate(checkpoint, rollback) && backend_.Sync(rollback);
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       rollback = std::make_error_code(std::errc::io_error);
     }
+#endif
     size_ = checkpoint;
     if (!restored) {
       state_ = FileState::kPoisoned;
