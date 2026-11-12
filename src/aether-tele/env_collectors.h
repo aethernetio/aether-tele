@@ -90,7 +90,7 @@ struct EnvTele<TSink, Config,
     if constexpr (SinkConfig.runtime_info) {
       env_data.custom_options = std::span{custom_options};
     }
-    auto& trap = sink.trap();
+    auto trap = sink_internal::TrapSnapshot(sink);
     if (!trap) {
       return;
     }

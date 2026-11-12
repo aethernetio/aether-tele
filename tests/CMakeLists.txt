@@ -24,6 +24,9 @@ CPMAddPackage(
   GITHUB_REPOSITORY ThrowTheSwitch/Unity
   GIT_TAG master
 )
+# Keep Unity's library ABI consistent with telemetry's uint64_t assertions on
+# both 32-bit and 64-bit hosts. Header-only defines leave x86 unity.c disabled.
+target_compile_definitions(unity PUBLIC UNITY_SUPPORT_64)
 
 add_executable(test-tele
   tele_test_common.cpp
@@ -42,3 +45,92 @@ endif()
 target_compile_definitions(test-tele PUBLIC AE_PROJECT_VERSION="1.2.3")
 
 add_test(NAME test-tele COMMAND $<TARGET_FILE:test-tele>)
+
+find_package(Threads REQUIRED)
+add_executable(test-raw-tele raw/compact.cpp)
+target_include_directories(test-raw-tele PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-raw-tele PRIVATE aether::tele_raw unity Threads::Threads)
+target_compile_definitions(test-raw-tele PRIVATE AE_TELE_RAW_DEBUG=1 AE_TELE_TEST_NATIVE_FILE=0)
+add_test(NAME test-raw-tele COMMAND test-raw-tele)
+add_executable(test-raw-reindexed raw/compact.cpp)
+target_include_directories(test-raw-reindexed PRIVATE ${PROJECT_SOURCE_DIR}/src)
+target_link_libraries(test-raw-reindexed PRIVATE aether::tele_raw unity Threads::Threads)
+target_compile_definitions(test-raw-reindexed PRIVATE AE_TELE_RAW_DEBUG=1 AE_TELE_TEST_NATIVE_FILE=0 RAW_TEST_TAG_INDEX=2000)
+add_test(NAME test-raw-reindexed COMMAND test-raw-reindexed)
+foreach(raw_target test-raw-tele test-raw-reindexed)
+  add_custom_command(TARGET ${raw_target} POST_BUILD
+    COMMAND $<TARGET_FILE:${raw_target}> --map $<TARGET_FILE_DIR:${raw_target}>/${raw_target}.map.json
+    COMMENT "Exporting raw telemetry debug map")
+endforeach()
+add_executable(test-tele-routing raw/legacy_routing.cpp raw/legacy_order_ab.cpp raw/legacy_order_ba.cpp)
+target_link_libraries(test-tele-routing PRIVATE aether::tele unity)
+add_test(NAME test-tele-routing COMMAND test-tele-routing)
+add_executable(test-statistics-concurrency raw/statistics_concurrency.cpp)
+target_link_libraries(test-statistics-concurrency PRIVATE aether::tele unity Threads::Threads)
+add_test(NAME test-statistics-concurrency COMMAND test-statistics-concurrency)
+set_tests_properties(test-statistics-concurrency PROPERTIES TIMEOUT 30)
+if(AE_TELE_BUILD_FILE_DRAIN)
+  add_executable(test-file-drain raw/compact.cpp)
+  target_link_libraries(test-file-drain PRIVATE aether::tele_file unity)
+  target_compile_definitions(test-file-drain PRIVATE AE_TELE_RAW_DEBUG=1 AE_TELE_TEST_NATIVE_FILE=1)
+  add_test(NAME test-file-drain COMMAND test-file-drain)
+  set_tests_properties(test-file-drain PROPERTIES TIMEOUT 60)
+  add_executable(test-file-backend raw/file_drain.cpp)
+  target_link_libraries(test-file-backend PRIVATE aether::tele_file unity)
+  add_test(NAME test-file-backend COMMAND test-file-backend)
+  set_tests_properties(test-file-backend PROPERTIES TIMEOUT 60)
+endif()
+set(AE_TELE_AETHER_SOURCE "" CACHE PATH "Optional Aether checkout for real telemetry API compatibility tests")
+if(AE_TELE_AETHER_SOURCE)
+  if(NOT EXISTS "${AE_TELE_AETHER_SOURCE}/aether/tele.h")
+    message(FATAL_ERROR "AE_TELE_AETHER_SOURCE must contain aether/tele.h")
+  endif()
+  add_executable(test-aether-tele-api raw/aether_api_probe.cpp)
+  target_link_libraries(test-aether-tele-api PRIVATE aether::tele unity)
+  target_include_directories(test-aether-tele-api PRIVATE ${AE_TELE_AETHER_SOURCE})
+  target_compile_definitions(test-aether-tele-api PRIVATE AE_DISTILLATION=1
+    AE_TELE_ENABLED=1 AE_TELE_LOG_MODULES=AE_ALL AE_TELE_DEBUG_MODULES=AE_ALL
+    AE_TELE_INFO_MODULES=AE_ALL AE_TELE_WARN_MODULES=AE_ALL AE_TELE_ERROR_MODULES=AE_ALL
+    AE_TELE_METRICS_MODULES=AE_ALL AE_TELE_METRICS_DURATION=AE_ALL
+    AE_TELE_LOG_TIME_POINT=AE_ALL AE_TELE_LOG_LEVEL_MODULE=AE_ALL AE_TELE_LOG_NAME=AE_ALL
+    AE_TELE_LOG_LOCATION=AE_ALL AE_TELE_LOG_BLOB=AE_ALL)
+  add_test(NAME test-aether-tele-api COMMAND test-aether-tele-api)
+endif()
+
+option(AE_TELE_RAW_TSAN "Instrument raw telemetry tests with ThreadSanitizer" OFF)
+if(AE_TELE_RAW_TSAN AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+  target_compile_options(test-raw-tele PRIVATE -fsanitize=thread -fno-omit-frame-pointer)
+  target_link_options(test-raw-tele PRIVATE -fsanitize=thread)
+endif()
+find_package(Python3 COMPONENTS Interpreter)
+if(Python3_FOUND)
+  if(TARGET test-file-drain)
+    add_test(NAME test-file-drain-restart COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/raw/compact_restart.py
+      --exe $<TARGET_FILE:test-file-drain>)
+    set_tests_properties(test-file-drain-restart PROPERTIES TIMEOUT 60)
+    add_test(NAME test-file-backend-restart COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/raw/compact_file_restart.py
+      --exe $<TARGET_FILE:test-file-backend>)
+    set_tests_properties(test-file-backend-restart PROPERTIES TIMEOUT 60)
+  endif()
+  add_test(NAME test-raw-decoder-regressions COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/raw/compact_decoder_test.py)
+  add_test(NAME test-raw-maps COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/raw/compact_maps.py
+    --exe $<TARGET_FILE:test-raw-tele>
+    --reindexed-exe $<TARGET_FILE:test-raw-reindexed>)
+  add_test(NAME test-raw-compile-fail COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/raw/compile_fail.py
+    --compiler ${CMAKE_CXX_COMPILER} --id ${CMAKE_CXX_COMPILER_ID}
+    --generator ${CMAKE_GENERATOR} --platform "${CMAKE_GENERATOR_PLATFORM}"
+    --include ${PROJECT_SOURCE_DIR}/src
+    --include ${ae-numeric_SOURCE_DIR}
+    --include ${gcem_SOURCE_DIR}/include
+    --source ${CMAKE_CURRENT_SOURCE_DIR}/raw/wrong_space.cpp)
+endif()
+
+add_executable(test-raw-sink raw/sink_adapter.cpp)
+target_link_libraries(test-raw-sink PRIVATE aether::tele unity Threads::Threads)
+target_compile_definitions(test-raw-sink PRIVATE AE_TELE_RAW_DEBUG=1)
+add_test(NAME test-raw-sink COMMAND test-raw-sink)

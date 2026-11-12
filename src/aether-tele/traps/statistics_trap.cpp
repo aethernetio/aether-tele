@@ -107,6 +107,7 @@ void StatisticsTrapBasic::AddInvokeDuration(Tag const& tag, Duration duration) {
 }
 
 void StatisticsTrapBasic::WriteEnvData(EnvData const& env_data) {
+  auto lock = std::scoped_lock{sync_lock_};
   env_store_.platform = env_data.platform_type;
   env_store_.compiler = env_data.compiler;
   env_store_.compiler_version = env_data.compiler_version;
@@ -121,6 +122,12 @@ void StatisticsTrapBasic::WriteEnvData(EnvData const& env_data) {
 }
 
 void StatisticsTrapBasic::MergeStatistics(StatisticsTrapBasic const& newer) {
+  if (this == &newer) return;
+  auto lock = std::scoped_lock{sync_lock_, newer.sync_lock_};
+  MergeStatisticsUnlocked(newer);
+}
+
+void StatisticsTrapBasic::MergeStatisticsUnlocked(StatisticsTrapBasic const& newer) {
   // just steal env_store_
   env_store_ = newer.env_store_;
 

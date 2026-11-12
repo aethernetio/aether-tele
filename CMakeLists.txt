@@ -28,13 +28,20 @@ endif()
 option(AE_TELE_BUILD_TESTS "Build aether-tele tests" ${IS_ROOT_PROJECT})
 option(AE_TELE_INSTALL "Install aether-tele library" ${IS_ROOT_PROJECT})
 
+# Native durable files are an optional host component, not an embedded dependency.
+set(_ae_tele_file_default OFF)
+if((WIN32 OR UNIX) AND NOT CMAKE_CROSSCOMPILING AND NOT ESP_PLATFORM AND NOT ANDROID)
+  set(_ae_tele_file_default ON)
+endif()
+option(AE_TELE_BUILD_FILE_DRAIN "Build the native host file drain adapter" ${_ae_tele_file_default})
+
 include(GNUInstallDirs)
 include(cmake/CPM.cmake)
 
 CPMAddPackage(
   NAME ae-numeric
   GITHUB_REPOSITORY aethernetio/aethernet-numeric
-  GIT_TAG main
+  GIT_TAG 9d79bd79188420533bab07c437d617aedfaf6b1a
   OPTIONS
     "AE_NUMERIC_INSTALL ${AE_TELE_INSTALL}"
     "AE_BUILD_TESTS OFF"
@@ -42,7 +49,7 @@ CPMAddPackage(
 CPMAddPackage(
   NAME aether-miscpp
   GITHUB_REPOSITORY aethernetio/aether-miscpp
-  GIT_TAG main
+  GIT_TAG 6839624442621a5b060ae610e91f480278ebaf6e
   OPTIONS
     "AE_INSTALL ${AE_TELE_INSTALL}"
     "AE_BUILD_TESTS OFF"
@@ -64,9 +71,35 @@ target_include_directories(aether-tele PUBLIC
 
 target_compile_features(aether-tele PUBLIC cxx_std_20)
 target_compile_options(aether-tele PUBLIC
-  $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>
+  "$<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor;/EHsc>"
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-fexceptions>
 )
 target_link_libraries(aether-tele PUBLIC aether-miscpp ae-numeric)
+
+# Raw telemetry uses numeric's fixed codecs; it does not require the legacy sink.
+add_library(aether-tele-raw INTERFACE)
+add_library(aether::tele_raw ALIAS aether-tele-raw)
+set_target_properties(aether-tele-raw PROPERTIES EXPORT_NAME tele_raw)
+target_include_directories(aether-tele-raw INTERFACE
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/src>
+  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_compile_features(aether-tele-raw INTERFACE cxx_std_20)
+target_compile_options(aether-tele-raw INTERFACE
+  $<$<CXX_COMPILER_ID:MSVC>:/EHsc>
+  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-fexceptions>)
+target_link_libraries(aether-tele-raw INTERFACE ae-numeric)
+
+if(AE_TELE_BUILD_FILE_DRAIN)
+  find_package(Threads REQUIRED)
+  add_library(aether-tele-file STATIC src/aether-tele/raw/file_native.cpp)
+  add_library(aether::tele_file ALIAS aether-tele-file)
+  set_target_properties(aether-tele-file PROPERTIES EXPORT_NAME tele_file)
+  target_include_directories(aether-tele-file PUBLIC
+    $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/src>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+  target_compile_features(aether-tele-file PUBLIC cxx_std_20)
+  target_link_libraries(aether-tele-file PUBLIC aether::tele_raw Threads::Threads)
+endif()
 
 if(AE_TELE_BUILD_TESTS)
   enable_testing()
@@ -74,7 +107,10 @@ if(AE_TELE_BUILD_TESTS)
 endif()
 
 if(AE_TELE_INSTALL)
-  install(TARGETS aether-tele EXPORT aether-teleTargets)
+  install(TARGETS aether-tele aether-tele-raw EXPORT aether-teleTargets)
+  if(AE_TELE_BUILD_FILE_DRAIN)
+    install(TARGETS aether-tele-file EXPORT aether-teleTargets)
+  endif()
   install(DIRECTORY src/aether-tele DESTINATION ${CMAKE_INSTALL_INCLUDEDIR} FILES_MATCHING PATTERN "*.h")
   install(EXPORT aether-teleTargets FILE aether-teleTargets.cmake NAMESPACE aether:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/aether-tele)
   include(CMakePackageConfigHelpers)

@@ -17,14 +17,47 @@
 #ifndef AETHER_TELE_SINK_H_
 #define AETHER_TELE_SINK_H_
 
+#include <atomic>
 #include <concepts>
 #include <memory>
+#include <utility>
 
 #include "aether-tele/itrap.h"
 #include "aether-tele/levels.h"
 #include "aether-tele/modules.h"  // IWYU pragma: keep
 
 namespace ae::tele {
+namespace sink_internal {
+// Keep the C++11 shared_ptr atomics for standard libraries without the C++20
+// specialization. Suppress only these deprecated compatibility calls; consumers
+// may still enable -Werror and deprecation diagnostics for their own code.
+#if defined(__clang__)
+#  pragma clang diagnostic push
+#  pragma clang diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(__GNUC__)
+#  pragma GCC diagnostic push
+#  pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#  pragma warning(push)
+#  pragma warning(disable : 4996)
+#endif
+template <typename T>
+std::shared_ptr<T> LoadShared(std::shared_ptr<T> const& slot) {
+  return std::atomic_load_explicit(&slot, std::memory_order_acquire);
+}
+template <typename T>
+void StoreShared(std::shared_ptr<T>& slot, std::shared_ptr<T> value) {
+  std::atomic_store_explicit(&slot, std::move(value),
+                             std::memory_order_release);
+}
+#if defined(__clang__)
+#  pragma clang diagnostic pop
+#elif defined(__GNUC__)
+#  pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#  pragma warning(pop)
+#endif
+}  // namespace sink_internal
 struct TeleConfig {
   bool count_metrics = true;
   bool time_metrics = true;
@@ -68,13 +101,51 @@ class TeleSink {
     return sink;
   }
 
-  constexpr void SetTrap(std::shared_ptr<ITrap> const& trap) { trap_ = trap; }
+  void SetTrap(std::shared_ptr<ITrap> const& trap) {
+    // Take a copy before publishing; an existing Tele keeps its original trap
+    // alive until its RAII duration is recorded.
+    sink_internal::StoreShared(trap_, trap);
+  }
 
+  std::shared_ptr<ITrap> GetTrap() const {
+    return sink_internal::LoadShared(trap_);
+  }
+
+  // Legacy reference getter retained for source compatibility. It is only safe
+  // while trap replacement is quiescent; concurrent readers must use GetTrap().
   constexpr auto const& trap() const { return trap_; }
 
  private:
   std::shared_ptr<ITrap> trap_;
 };
+
+// Explicit namespace identity for consumers sharing the same configuration.
+// The existing TeleSink<CP> and its instance remain unchanged.
+template <typename Identity, ConfigProvider CP>
+class NamespacedTeleSink : public TeleSink<CP> {
+ public:
+  static NamespacedTeleSink& Instance() {
+    static NamespacedTeleSink sink;
+    return sink;
+  }
+};
+
+namespace sink_internal {
+// Existing custom sinks need only implement trap(); new TeleSink users obtain
+// a synchronized owning snapshot without changing the historical getter API.
+template <typename Sink>
+std::shared_ptr<ITrap> TrapSnapshot(Sink& sink) {
+  if constexpr (requires {
+                  {
+                    sink.GetTrap()
+                  } -> std::convertible_to<std::shared_ptr<ITrap>>;
+                }) {
+    return sink.GetTrap();
+  } else {
+    return sink.trap();
+  }
+}
+}  // namespace sink_internal
 }  // namespace ae::tele
 
 #endif  // AETHER_TELE_SINK_H_

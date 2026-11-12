@@ -154,12 +154,19 @@ struct Tele<TSink, Config, std::enable_if_t<kIsAnyTele<Config>>> {
                  [[maybe_unused]] BlobArgs&&... args) noexcept
       : timed_tele_{std::invoke([&]() -> TimedTele {
           if constexpr (SinkConfig.time_metrics) {
-            return TimedTele{.timer = {}, .tag = tag, .trap = sink.trap()};
+            return TimedTele{.timer = {}, .tag = tag,
+                             .trap = sink_internal::TrapSnapshot(sink)};
           } else {
             return TimedTele{};
           }
         })} {
-    auto trap = sink.trap();
+    auto trap = std::invoke([&]() -> std::shared_ptr<ITrap> {
+      if constexpr (SinkConfig.time_metrics) {
+        return timed_tele_.trap;
+      } else {
+        return sink_internal::TrapSnapshot(sink);
+      }
+    });
     if (!trap) {
       return;
     }
