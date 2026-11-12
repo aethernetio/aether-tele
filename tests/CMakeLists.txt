@@ -24,6 +24,9 @@ CPMAddPackage(
   GITHUB_REPOSITORY ThrowTheSwitch/Unity
   GIT_TAG master
 )
+# Keep Unity's library ABI consistent with telemetry's uint64_t assertions on
+# both 32-bit and 64-bit hosts. Header-only defines leave x86 unity.c disabled.
+target_compile_definitions(unity PUBLIC UNITY_SUPPORT_64)
 
 add_executable(test-tele
   tele_test_common.cpp
