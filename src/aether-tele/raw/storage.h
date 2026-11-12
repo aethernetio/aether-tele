@@ -200,12 +200,16 @@ class Stream {
     }
     if (persisted || to_console) AdvanceSequence();
     if (to_console) {
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
       try {
+#endif
         console_(console_context_, console_bytes);
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
       } catch (...) {
         Increment(console_failures_);
         return false;
       }
+#endif
     }
     return success;
   }
@@ -388,11 +392,15 @@ class Stream {
       return false;
     auto const block = wire::FinishBlock(frame, cursor);
     if (block.empty()) return false;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       if (!drain_(drain_context_, block)) return false;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       return false;
     }
+#endif
     e.retry_pending = false;
     e.retry = {};
     return true;
@@ -411,11 +419,15 @@ class Stream {
       if (e.retry_pending && !DrainMetricRetry(e)) return false;
     if (!used_) return true;
     if (!drain_) return false;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       if (!drain_(drain_context_, pending())) return false;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       return false;
     }
+#endif
     used_ = 0;
     frozen_ = false;
     return true;

@@ -25,9 +25,9 @@ jobs:
           "-DCMAKE_CXX_FLAGS=-fsanitize=${{ matrix.sanitizer }} -fno-omit-frame-pointer -fno-pie"
           "-DCMAKE_EXE_LINKER_FLAGS=-fsanitize=${{ matrix.sanitizer }} -no-pie"
       - name: Build raw tests
-        run: cmake --build build-raw --target test-raw-tele test-raw-sink test-file-drain test-file-backend test-tele-routing test-statistics-concurrency --parallel 4
+        run: cmake --build build-raw --target test-raw-tele test-raw-sink test-raw-multitu test-raw-no-exceptions test-file-drain test-file-backend test-tele-routing test-statistics-concurrency --parallel 4
       - name: Run raw tests
-        run: ctest --test-dir build-raw --output-on-failure -R '^test-(raw-tele|raw-sink|file-drain|file-drain-restart|file-backend|file-backend-restart|tele-routing|statistics-concurrency)$'
+        run: ctest --test-dir build-raw --output-on-failure -R '^test-(raw-tele|raw-sink|raw-multitu|raw-no-exceptions|file-drain|file-drain-restart|file-backend|file-backend-restart|tele-routing|statistics-concurrency)$'
 
   build:
     name: ${{ matrix.config.name }}

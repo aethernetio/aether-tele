@@ -134,3 +134,17 @@ add_executable(test-raw-sink raw/sink_adapter.cpp)
 target_link_libraries(test-raw-sink PRIVATE aether::tele unity Threads::Threads)
 target_compile_definitions(test-raw-sink PRIVATE AE_TELE_RAW_DEBUG=1)
 add_test(NAME test-raw-sink COMMAND test-raw-sink)
+
+foreach(sink_fixture test-raw-multitu test-raw-no-exceptions)
+  add_executable(${sink_fixture} raw/sink_multitu.cpp raw/sink_multitu_a.cpp
+    raw/sink_multitu_b.cpp)
+  target_link_libraries(${sink_fixture} PRIVATE aether::tele Threads::Threads)
+  target_compile_definitions(${sink_fixture} PRIVATE AE_PROJECT_VERSION="1.2.3")
+  add_test(NAME ${sink_fixture} COMMAND ${sink_fixture})
+  set_tests_properties(${sink_fixture} PROPERTIES TIMEOUT 30)
+endforeach()
+target_compile_definitions(test-raw-no-exceptions PRIVATE AE_TEST_NO_EXCEPTIONS=1
+  $<$<CXX_COMPILER_ID:MSVC>:_HAS_EXCEPTIONS=0>)
+target_compile_options(test-raw-no-exceptions PRIVATE
+  "$<$<CXX_COMPILER_ID:MSVC>:/GR-;/EHs-c->"
+  "$<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-fno-rtti;-fno-exceptions>")

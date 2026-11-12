@@ -77,7 +77,9 @@ class RawTeleSink {
     }
     std::unique_lock binding(binding_gate_);
     raw::BackendCallbackGuard operation;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       auto writers = Writers();
       for (auto const& writer : writers) {
         std::lock_guard lock(writer->mutex);
@@ -94,10 +96,12 @@ class RawTeleSink {
       writers.clear();
       CollectRetired();
       return true;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       ++failures_;
       return false;
     }
+#endif
   }
   void SetRuntime(raw::Options options) { space_.SetRuntime(options); }
   raw::Options Runtime() const { return space_.Runtime(); }
@@ -110,8 +114,10 @@ class RawTeleSink {
     std::shared_lock binding(binding_gate_);
     raw::BackendCallbackGuard operation;
     if (id > raw::wire::kMaxStream) return false;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
-      auto previous = current_.writer.lock();
+#endif
+      auto previous = Current().writer.lock();
       if (previous && !previous->retired.load() && previous->stream.id() == id)
         return true;
       auto next = CreateWriter(id);
@@ -125,14 +131,16 @@ class RawTeleSink {
         previous->clean = true;
         previous->retired.store(true);
       }
-      current_.writer = next;
-      current_.id = id;
-      current_.assigned = true;
+      Current().writer = next;
+      Current().id = id;
+      Current().assigned = true;
       return true;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       ++failures_;
       return false;
     }
+#endif
   }
   bool DrainCurrent() noexcept {
     if (raw::BackendCallbackActive()) {
@@ -141,7 +149,7 @@ class RawTeleSink {
     }
     std::shared_lock binding(binding_gate_);
     raw::BackendCallbackGuard operation;
-    auto writer = current_.writer.lock();
+    auto writer = Current().writer.lock();
     if (!writer) return true;
     std::lock_guard lock(writer->mutex);
     auto const saved = writer->stream.DrainMetrics();
@@ -155,7 +163,9 @@ class RawTeleSink {
     }
     std::shared_lock binding(binding_gate_);
     raw::BackendCallbackGuard operation;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       auto writers = Writers();
       for (auto const& writer : writers) {
         std::lock_guard lock(writer->mutex);
@@ -165,10 +175,12 @@ class RawTeleSink {
       writers.clear();
       CollectRetired();
       return true;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       ++failures_;
       return false;
     }
+#endif
   }
   std::uint32_t CurrentWriterId() noexcept {
     if (raw::BackendCallbackActive()) {
@@ -189,12 +201,14 @@ class RawTeleSink {
     // registered writer could acknowledge a delta between snapshot and query.
     std::unique_lock binding(binding_gate_);
     raw::BackendCallbackGuard operation;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
-      if (!current_.assigned && !AcquireWriter()) return {};
+#endif
+      if (!Current().assigned && !AcquireWriter()) return {};
       auto writers = Writers();
       writers.erase(std::remove_if(writers.begin(), writers.end(),
                                    [&](auto const& writer) {
-                                     return writer->stream.id() != current_.id;
+                                     return writer->stream.id() != Current().id;
                                    }),
                     writers.end());
       std::vector<std::unique_lock<std::recursive_mutex>> locks;
@@ -204,7 +218,7 @@ class RawTeleSink {
       if (backend) {
         std::array<raw::MetricTotal, MetricCapacity> totals{};
         std::size_t count = 0;
-        if (!backend->RestoreMetrics(kName, current_.id, totals, count) ||
+        if (!backend->RestoreMetrics(kName, Current().id, totals, count) ||
             count > totals.size()) {
           ++failures_;
           return {};
@@ -228,10 +242,12 @@ class RawTeleSink {
       for (auto const& writer : writers)
         raw::AccumulateMetric(result, writer->stream.PendingMetricFor(index));
       return result;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       ++failures_;
       return {};
     }
+#endif
   }
   std::shared_ptr<ITrap> GetTrap() const {
     auto legacy = sink_internal::LoadShared(legacy_trap_);
@@ -396,7 +412,9 @@ class RawTeleSink {
       }
       writers_.push_back(writer);  // reserve this live ID before user code
     }
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       for (auto const& previous : predecessors) {
         std::lock_guard lock(previous->mutex);
         if (!previous->stream.DrainMetrics()) {
@@ -417,11 +435,13 @@ class RawTeleSink {
         ++failures_;
         return {};
       }
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       RemoveWriter(writer);
       ++failures_;
       return {};
     }
+#endif
     {
       std::lock_guard lock(writers_mutex_);
       writer->ready = true;
@@ -429,11 +449,13 @@ class RawTeleSink {
     return writer;
   }
   std::shared_ptr<Writer> AcquireWriter() noexcept {
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
-      if (auto writer = current_.writer.lock();
+#endif
+      if (auto writer = Current().writer.lock();
           writer && !writer->retired.load())
         return writer;
-      if (!current_.assigned) {
+      if (!Current().assigned) {
         std::lock_guard lock(writers_mutex_);
         while (next_writer_ <= raw::wire::kMaxStream &&
                std::any_of(writers_.begin(), writers_.end(),
@@ -446,16 +468,18 @@ class RawTeleSink {
           ++failures_;
           return {};
         }
-        current_.id = next_writer_++;
-        current_.assigned = true;
+        Current().id = next_writer_++;
+        Current().assigned = true;
       }
-      auto writer = CreateWriter(current_.id);
-      if (writer) current_.writer = writer;
+      auto writer = CreateWriter(Current().id);
+      if (writer) Current().writer = writer;
       return writer;
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       ++failures_;
       return {};
     }
+#endif
   }
   std::optional<raw::Tag<SpaceType>> Resolve(Tag const& tag, Level level,
                                              std::string_view file,
@@ -514,7 +538,10 @@ class RawTeleSink {
   bool sites_valid_{true};
   std::uint32_t next_writer_{1};
   std::atomic<std::uint64_t> failures_{};
-  inline static thread_local Cache current_;
+  static Cache& Current() {
+    thread_local Cache current;
+    return current;
+  }
 };
 
 namespace raw_sink_internal {
@@ -525,7 +552,9 @@ class Event {
   Event(Sink& sink, Tag const& tag, Level level, std::string_view file,
         int line, FormatScheme format = collectors_internal::kEmptyFormat,
         Args&&... args) noexcept {
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
+#endif
       if (raw::BackendCallbackActive()) {
         ++sink.failures_;
         return;
@@ -553,9 +582,11 @@ class Event {
       std::lock_guard lock(writer_->mutex);
       writer_->clean = false;
       scope_.emplace(writer_->stream, *descriptor, options, data);
+#if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       ++sink.failures_;
     }
+#endif
   }
   Event(Event const&) = delete;
   Event& operator=(Event const&) = delete;

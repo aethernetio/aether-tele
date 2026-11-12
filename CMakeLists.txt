@@ -71,8 +71,7 @@ target_include_directories(aether-tele PUBLIC
 
 target_compile_features(aether-tele PUBLIC cxx_std_20)
 target_compile_options(aether-tele PUBLIC
-  "$<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor;/EHsc>"
-  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-fexceptions>
+  $<$<CXX_COMPILER_ID:MSVC>:/Zc:preprocessor>
 )
 target_link_libraries(aether-tele PUBLIC aether-miscpp ae-numeric)
 
@@ -84,9 +83,6 @@ target_include_directories(aether-tele-raw INTERFACE
   $<BUILD_INTERFACE:${CMAKE_CURRENT_LIST_DIR}/src>
   $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
 target_compile_features(aether-tele-raw INTERFACE cxx_std_20)
-target_compile_options(aether-tele-raw INTERFACE
-  $<$<CXX_COMPILER_ID:MSVC>:/EHsc>
-  $<$<COMPILE_LANG_AND_ID:CXX,GNU,Clang,AppleClang>:-fexceptions>)
 target_link_libraries(aether-tele-raw INTERFACE ae-numeric)
 
 if(AE_TELE_BUILD_FILE_DRAIN)

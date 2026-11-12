@@ -5,9 +5,14 @@ of `StatisticsTrap` remain available. The new `aether-tele/raw.h` layer records
 plain data; it does not change Aether's persistent `TeleStatistics` object or
 the cloud protocol.
 
-The public headers require C++20 and C++ exceptions. The exported CMake targets
-enable exception support for consumers, including projects whose toolchain
-otherwise disables it. The raw library does not require RTTI.
+The public headers require C++20. Both exception-enabled and exception-disabled
+consumers are supported, and the CMake targets preserve the consumer's policy.
+With exceptions enabled, callback exceptions are contained and failed drains
+remain available for retry. Without exceptions, callbacks must report failures
+through their return values; allocation failures follow the toolchain's fatal
+failure policy. The raw library does not require RTTI. Backends can optionally
+expose a process-local `TypeToken()` for checked concrete-type access without
+RTTI; the default token is null.
 
 ## Raw telemetry
 
