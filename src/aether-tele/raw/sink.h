@@ -61,7 +61,7 @@ class RawTeleSink {
   }
 
   std::shared_ptr<raw::IBackend> GetBackend() const {
-    return backend_.load(std::memory_order_acquire);
+    return std::atomic_load_explicit(&backend_, std::memory_order_acquire);
   }
   // Migration runs under the exclusive binding gate after old writers drain.
   // Failure preserves the binding and all unacknowledged pending bytes. Open
@@ -87,10 +87,12 @@ class RawTeleSink {
       if (migrate && !migrate(GetBackend())) return false;
       for (auto const& writer : writers) {
         std::lock_guard lock(writer->mutex);
-        writer->backend.store(backend, std::memory_order_release);
+        std::atomic_store_explicit(&writer->backend, backend,
+                                   std::memory_order_release);
         writer->retired.store(true, std::memory_order_release);
       }
-      backend_.store(std::move(backend), std::memory_order_release);
+      std::atomic_store_explicit(&backend_, std::move(backend),
+                                 std::memory_order_release);
       writers.clear();
       CollectRetired();
       return true;
@@ -234,11 +236,13 @@ class RawTeleSink {
     }
   }
   std::shared_ptr<ITrap> GetTrap() const {
-    auto legacy = legacy_trap_.load(std::memory_order_acquire);
+    auto legacy =
+        std::atomic_load_explicit(&legacy_trap_, std::memory_order_acquire);
     return legacy ? legacy : env_bridge_;
   }
   void SetTrap(std::shared_ptr<ITrap> trap) {
-    legacy_trap_.store(std::move(trap), std::memory_order_release);
+    std::atomic_store_explicit(&legacy_trap_, std::move(trap),
+                               std::memory_order_release);
   }
   // Retained for source-level environment integration; owning GetTrap() is the
   // synchronized API. Raw event recording always uses GetBackend().
@@ -291,17 +295,19 @@ class RawTeleSink {
           owner(std::this_thread::get_id()) {}
     static bool Append(void* context, std::span<std::uint8_t const> bytes) {
       auto& self = *static_cast<Writer*>(context);
-      auto target = self.backend.load(std::memory_order_acquire);
+      auto target =
+          std::atomic_load_explicit(&self.backend, std::memory_order_acquire);
       raw::BackendCallbackGuard guard;
       return target && target->Append(kName, bytes);
     }
     static void Console(void* context, std::span<std::uint8_t const> bytes) {
       auto& self = *static_cast<Writer*>(context);
-      auto target = self.backend.load(std::memory_order_acquire);
+      auto target =
+          std::atomic_load_explicit(&self.backend, std::memory_order_acquire);
       raw::BackendCallbackGuard guard;
       if (target) target->Console(kName, bytes);
     }
-    std::atomic<std::shared_ptr<raw::IBackend>> backend;
+    std::shared_ptr<raw::IBackend> backend;
     StreamType stream;
     std::thread::id owner;
     std::recursive_mutex mutex;
@@ -502,8 +508,10 @@ class RawTeleSink {
     return result;
   }
   SpaceType space_;
-  std::atomic<std::shared_ptr<raw::IBackend>> backend_;
-  std::atomic<std::shared_ptr<ITrap>> legacy_trap_;
+  // The shared_ptr atomic free functions also work on Apple libc++ versions
+  // that do not implement C++20 atomic<shared_ptr<T>> yet.
+  std::shared_ptr<raw::IBackend> backend_;
+  std::shared_ptr<ITrap> legacy_trap_;
   std::shared_ptr<ITrap> env_bridge_;
   mutable std::shared_mutex binding_gate_;
   mutable std::mutex writers_mutex_, sites_mutex_;
