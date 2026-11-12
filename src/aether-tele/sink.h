@@ -18,6 +18,7 @@
 #define AETHER_TELE_SINK_H_
 
 #include <concepts>
+#include <atomic>
 #include <memory>
 
 #include "aether-tele/itrap.h"
@@ -68,13 +69,49 @@ class TeleSink {
     return sink;
   }
 
-  constexpr void SetTrap(std::shared_ptr<ITrap> const& trap) { trap_ = trap; }
+  void SetTrap(std::shared_ptr<ITrap> const& trap) {
+    // Take a copy before publishing; an existing Tele keeps its original trap
+    // alive until its RAII duration is recorded.
+    std::atomic_store_explicit(&trap_, trap, std::memory_order_release);
+  }
 
+  std::shared_ptr<ITrap> GetTrap() const {
+    return std::atomic_load_explicit(&trap_, std::memory_order_acquire);
+  }
+
+  // Legacy reference getter retained for source compatibility. It is only safe
+  // while trap replacement is quiescent; concurrent readers must use GetTrap().
   constexpr auto const& trap() const { return trap_; }
 
  private:
   std::shared_ptr<ITrap> trap_;
 };
+
+// Explicit namespace identity for consumers sharing the same configuration.
+// The existing TeleSink<CP> and its instance remain unchanged.
+template <typename Identity, ConfigProvider CP>
+class NamespacedTeleSink : public TeleSink<CP> {
+ public:
+  static NamespacedTeleSink& Instance() {
+    static NamespacedTeleSink sink;
+    return sink;
+  }
+};
+
+namespace sink_internal {
+// Existing custom sinks need only implement trap(); new TeleSink users obtain
+// a synchronized owning snapshot without changing the historical getter API.
+template <typename Sink>
+std::shared_ptr<ITrap> TrapSnapshot(Sink& sink) {
+  if constexpr (requires {
+                  { sink.GetTrap() } -> std::convertible_to<std::shared_ptr<ITrap>>;
+                }) {
+    return sink.GetTrap();
+  } else {
+    return sink.trap();
+  }
+}
+}  // namespace sink_internal
 }  // namespace ae::tele
 
 #endif  // AETHER_TELE_SINK_H_

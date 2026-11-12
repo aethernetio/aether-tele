@@ -180,7 +180,10 @@ class StatisticsTrapBasic : public ITrap {
   AE_REFLECT_MEMBERS(metrics_store_, env_store_)
 
  protected:
-  std::mutex sync_lock_;
+  // Reference getters/serialization require a quiescent trap. Mutation and
+  // MergeStatistics synchronize both participants through this mutex.
+  void MergeStatisticsUnlocked(StatisticsTrapBasic const& newer);
+  mutable std::mutex sync_lock_;
   MetricsStore metrics_store_{};
   EnvStore env_store_{};
 };
@@ -203,7 +206,9 @@ class StatisticsTrap final : public StatisticsTrapBasic {
    * \brief Merge newer statistics storage into this
    */
   void MergeStatistics(StatisticsTrap const& newer) {
-    StatisticsTrapBasic::MergeStatistics(newer);
+    if (this == &newer) return;
+    auto lock = std::scoped_lock{sync_lock_, newer.sync_lock_};
+    MergeStatisticsUnlocked(newer);
     // write newer logs on top of current
     auto size = newer.log_storage_.size();
     auto s = newer.log_storage_.start;

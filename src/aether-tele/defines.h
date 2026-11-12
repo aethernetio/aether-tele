@@ -43,12 +43,29 @@
 AE_TELE_MODULE(MLog, AE_LOG_MODULE, AE_LOG_MODULE, AE_LOG_MODULE);
 AE_TAG(kLog, MLog)
 
-#define AE_TELE_(TAG_NAME, TAG, LEVEL, ...)                                   \
-  [[maybe_unused]] auto TAG_NAME = ::ae::tele::Tele<                          \
-      TELE_SINK, TELE_SINK::template GetTeleConfig<LEVEL, TAG.module.id>()> { \
-    TELE_SINK::Instance(), TAG, ::ae::tele::Level{LEVEL}, __FILE__, __LINE__, \
-        __VA_ARGS__                                                           \
-  }
+// A direct declaration preserves the original caller scope and RAII lifetime.
+// In particular, do not introduce a lambda or a conditional Tele temporary:
+// callers may use __func__, and supported MSVC releases materialize a copy of
+// the conditional's Tele, recording duration before the caller scope ends.
+#define AE_TELE_SINK_CONFIG(SINK, TAG, LEVEL) \
+  SINK::template GetTeleConfig<LEVEL, (TAG).module.id>()
+#define AE_TELE_WITH_SINK(SINK, TAG_NAME, TAG, LEVEL, ...)                    \
+  [[maybe_unused]] auto TAG_NAME =                                         \
+      ::ae::tele::Tele<SINK, AE_TELE_SINK_CONFIG(SINK, TAG, LEVEL)>{          \
+          SINK::Instance(), TAG, ::ae::tele::Level{LEVEL}, __FILE__,         \
+          __LINE__, __VA_ARGS__}
+
+#define AE_TELE_(TAG_NAME, TAG, LEVEL, ...) \
+  AE_TELE_WITH_SINK(TELE_SINK, TAG_NAME, TAG, LEVEL, __VA_ARGS__)
+
+#define AE_TELE_DEBUG_TO(SINK, TAG, ...) \
+  AE_TELE_WITH_SINK(SINK, AETE_UNIQUE_NAME(TELE_), TAG, ::ae::tele::Level::kDebug, __VA_ARGS__)
+#define AE_TELE_INFO_TO(SINK, TAG, ...) \
+  AE_TELE_WITH_SINK(SINK, AETE_UNIQUE_NAME(TELE_), TAG, ::ae::tele::Level::kInfo, __VA_ARGS__)
+#define AE_TELE_WARNING_TO(SINK, TAG, ...) \
+  AE_TELE_WITH_SINK(SINK, AETE_UNIQUE_NAME(TELE_), TAG, ::ae::tele::Level::kWarning, __VA_ARGS__)
+#define AE_TELE_ERROR_TO(SINK, TAG, ...) \
+  AE_TELE_WITH_SINK(SINK, AETE_UNIQUE_NAME(TELE_), TAG, ::ae::tele::Level::kError, __VA_ARGS__)
 
 #define AE_TELE_DEBUG(TAG, ...) \
   AE_TELE_(AETE_UNIQUE_NAME(TELE_), TAG, ::ae::tele::Level::kDebug, __VA_ARGS__)
@@ -74,10 +91,12 @@ AE_TAG(kLog, MLog)
            __VA_ARGS__)
 
 // Log environment data
-#define AE_TELE_ENV(...)                                          \
+#define AE_TELE_ENV_TO(SINK, ...)                                 \
   [[maybe_unused]] auto AETE_UNIQUE_NAME(TELE_ENV_) =             \
-      ::ae::tele::EnvTele<TELE_SINK, TELE_SINK::GetEnvConfig()> { \
-    TELE_SINK::Instance(), UTM_ID, __VA_ARGS__                    \
+      ::ae::tele::EnvTele<SINK, SINK::GetEnvConfig()> {            \
+    SINK::Instance(), UTM_ID, __VA_ARGS__                         \
   }
+
+#define AE_TELE_ENV(...) AE_TELE_ENV_TO(TELE_SINK, __VA_ARGS__)
 
 #endif  // AETHER_TELE_DEFINES_H_ */

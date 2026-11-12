@@ -3,13 +3,16 @@
 include(CMakeFindDependencyMacro)
 
 find_dependency(gcem CONFIG)
+if(@AE_TELE_BUILD_FILE_DRAIN@)
+  find_dependency(Threads)
+endif()
 
 if(NOT TARGET aether-miscpp)
   include("${CMAKE_CURRENT_LIST_DIR}/../aether-miscpp/aether-miscppTargets.cmake")
 endif()
 
-if(NOT TARGET numeric)
-  include("${CMAKE_CURRENT_LIST_DIR}/../numeric/numericTargets.cmake")
+if(NOT TARGET ae-numeric)
+  include("${CMAKE_CURRENT_LIST_DIR}/../ae-numeric/ae-numericTargets.cmake")
 endif()
 
 include("${CMAKE_CURRENT_LIST_DIR}/aether-teleTargets.cmake")
