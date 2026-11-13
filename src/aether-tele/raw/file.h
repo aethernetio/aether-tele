@@ -58,14 +58,10 @@ struct FileStatus {
   std::error_code rollback_error{};
   std::uint64_t offset{};
 };
-struct FileOptions {
-  std::uint32_t max_record_bytes = wire::BlockSizeCodec::kUpper;
-  bool repair_incomplete_tail = true;
-};
+struct FileOptions {};
 struct RecoveryInfo {
   std::uint64_t original_size{};
   std::uint64_t valid_size{};
-  std::uint64_t truncated_bytes{};
   bool directory_sync_supported{};
 };
 
@@ -83,13 +79,10 @@ class BasicFileDrain {
   BasicFileDrain& operator=(BasicFileDrain const&) = delete;
 
   bool Open(std::filesystem::path const& path,
-            FileOptions options = {}) noexcept {
+            FileOptions /*options*/ = {}) noexcept {
     std::lock_guard lock(mutex_);
     if (state_ == FileState::kPoisoned) return false;
     if (state_ != FileState::kClosed) return Fail(FileError::kAlreadyOpen);
-    if (options.max_record_bytes < kMinBlockSize)
-      return Fail(FileError::kInvalidOptions);
-    options_ = options;
     recovery_ = {};
     recovery_.directory_sync_supported = Backend::kDirectorySyncSupported;
     size_ = 0;
@@ -105,17 +98,6 @@ class BasicFileDrain {
         CloseBackend();  // Scan never mutates the existing file.
         return false;
       }
-      if (recovery_.valid_size != recovery_.original_size) {
-        if (!options_.repair_incomplete_tail)
-          return OpenFailure(FileError::kIncompleteFile, {},
-                             recovery_.valid_size);
-        // Any failure after starting repair leaves durability uncertain. Keep
-        // the lock until Close; this object stays poisoned permanently. The
-        // owner must reconcile and create a fresh adapter before any retry.
-        state_ = FileState::kPoisoned;
-        if (!backend_.Truncate(recovery_.valid_size, error))
-          return Fail(FileError::kWrite, error, recovery_.valid_size);
-      }
       if (!backend_.Sync(error)) {
         if (state_ == FileState::kPoisoned)
           return Fail(FileError::kSync, error, recovery_.valid_size);
@@ -128,8 +110,6 @@ class BasicFileDrain {
                            recovery_.valid_size);
       }
       size_ = recovery_.valid_size;
-      recovery_.truncated_bytes =
-          recovery_.original_size - recovery_.valid_size;
       state_ = FileState::kReady;
       status_ = {};
       return true;
@@ -182,36 +162,23 @@ class BasicFileDrain {
         return fail(FileError::kExternalChange);
       }
       std::vector<MetricTotal> totals;
-      std::vector<std::uint8_t> frame;
-      while (offset < size_) {
-        std::uint64_t declared{};
-        bool incomplete{};
-        if (!ReadBlockSize(offset, size_ - offset, declared, incomplete, error))
-          return finish(false);
-        if (incomplete || declared > size_ - offset)
-          return fail(FileError::kMalformedFile, {}, offset);
-        frame.resize(declared);
-        if (!ReadExact(offset, frame, error))
-          return fail(FileError::kRead, error, offset);
-        auto const decoded = Decode(frame);
-        if (decoded.status != DecodeStatus::kOk || decoded.records.empty())
-          return fail(FileError::kMalformedFile, {}, offset);
-        for (auto const& record : decoded.records) {
-          if (record.metric && record.stream == stream.id()) {
-            auto found = std::find_if(
-                totals.begin(), totals.end(),
-                [&](auto const& total) { return total.index == record.index; });
-            if (found == totals.end()) {
-              if (totals.size() == StreamT::kMetricCapacity)
-                return fail(FileError::kMetricCapacity, {}, offset);
-              totals.push_back({record.index, {}});
-              AccumulateMetric(totals.back().metric, *record.metric);
-            } else {
-              AccumulateMetric(found->metric, *record.metric);
-            }
-          }
+      std::vector<std::uint8_t> contents(static_cast<std::size_t>(size_));
+      if (!ReadExact(0, contents, error)) return fail(FileError::kRead, error);
+      auto const decoded = Decode(contents);
+      if (decoded.status != DecodeStatus::kOk)
+        return fail(FileError::kMalformedFile);
+      for (auto const& record : decoded.records) {
+        if (!record.metric || record.stream != stream.id()) continue;
+        auto found = std::find_if(
+            totals.begin(), totals.end(),
+            [&](auto const& total) { return total.index == record.index; });
+        if (found == totals.end()) {
+          if (totals.size() == StreamT::kMetricCapacity)
+            return fail(FileError::kMetricCapacity);
+          totals.push_back({record.index, {}});
+          found = totals.end() - 1;
         }
-        offset += declared;
+        AccumulateMetric(found->metric, *record.metric);
       }
       if (!stream.RestoreMetrics(std::span<MetricTotal const>{totals}))
         return fail(FileError::kRestoreState);
@@ -305,6 +272,7 @@ class BasicFileDrain {
       if (!backend_.Sync(error))
         return finish(Rollback(checkpoint, failure, error));
       size_ = checkpoint + bytes.size();
+      decode_state_ = std::move(pending_state_);
       status_ = {};
       return finish(true);
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
@@ -398,71 +366,21 @@ class BasicFileDrain {
     }
     return true;
   }
-  bool ReadBlockSize(std::uint64_t offset, std::uint64_t remaining,
-                     std::uint64_t& declared, bool& incomplete,
-                     std::error_code& error) {
-    std::array<std::uint8_t, wire::BlockSizeCodec::kMaxWireBytes> prefix{};
-    auto const available = static_cast<std::size_t>(
-        std::min<std::uint64_t>(remaining, prefix.size()));
-    if (!ReadExact(offset, std::span{prefix}.first(available), error))
-      return Fail(FileError::kRead, error, offset);
-    std::size_t cursor = 0;
-    auto const status = wire::Read<wire::BlockSizeCodec>(
-        std::span{prefix}.first(available), cursor, declared);
-    incomplete = status == wire::ReadStatus::kTruncated;
-    if (incomplete) return true;
-    if (status != wire::ReadStatus::kOk || declared < kMinBlockSize ||
-        declared < cursor)
-      return Fail(FileError::kMalformedFile, {}, offset);
-    if (declared > options_.max_record_bytes)
-      return Fail(FileError::kRecordTooLarge, {}, offset);
-    return true;
-  }
   bool Scan(std::error_code& error) {
-    std::vector<std::uint8_t> frame;
-    while (recovery_.valid_size < recovery_.original_size) {
-      auto const offset = recovery_.valid_size;
-      auto const remaining = recovery_.original_size - offset;
-      std::uint64_t declared{};
-      bool incomplete{};
-      if (!ReadBlockSize(offset, remaining, declared, incomplete, error))
-        return false;
-      if (incomplete) return true;
-      auto const available = static_cast<std::size_t>(
-          std::min<std::uint64_t>(declared, remaining));
-      frame.resize(available);
-      if (!ReadExact(offset, frame, error))
-        return Fail(FileError::kRead, error, offset);
-      auto decoded = Decode(frame);
-      if (decoded.status == DecodeStatus::kMalformed)
-        return Fail(FileError::kMalformedFile, {}, offset);
-      if (decoded.status == DecodeStatus::kTruncated) return true;
-      if (decoded.valid_bytes != declared || decoded.records.empty())
-        return Fail(FileError::kMalformedFile, {}, offset);
-      recovery_.valid_size += declared;
-    }
+    std::vector<std::uint8_t> contents(
+        static_cast<std::size_t>(recovery_.original_size));
+    if (!ReadExact(0, contents, error)) return Fail(FileError::kRead, error);
+    decode_state_ = {};
+    auto decoded = Decode(contents, decode_state_);
+    if (decoded.status != DecodeStatus::kOk)
+      return Fail(FileError::kMalformedFile);
+    recovery_.valid_size = recovery_.original_size;
     return true;
   }
   bool Validate(std::span<std::uint8_t const> bytes) {
-    std::size_t offset = 0;
-    while (offset < bytes.size()) {
-      auto const remaining = bytes.subspan(offset);
-      std::size_t cursor = 0;
-      std::uint64_t declared{};
-      if (wire::Read<wire::BlockSizeCodec>(remaining, cursor, declared) !=
-          wire::ReadStatus::kOk)
-        return Fail(FileError::kInvalidInput, {}, size_);
-      if (declared > options_.max_record_bytes)
-        return Fail(FileError::kRecordTooLarge, {}, size_);
-      if (declared < kMinBlockSize || declared < cursor ||
-          declared > remaining.size())
-        return Fail(FileError::kInvalidInput, {}, size_);
-      auto decoded = Decode(remaining.first(declared));
-      if (decoded.status != DecodeStatus::kOk || decoded.records.empty())
-        return Fail(FileError::kInvalidInput, {}, size_);
-      offset += declared;
-    }
-    return true;
+    pending_state_ = decode_state_;
+    return Decode(bytes, pending_state_).status == DecodeStatus::kOk ||
+           Fail(FileError::kInvalidInput);
   }
   bool Rollback(std::uint64_t checkpoint, FileError original,
                 std::error_code error) noexcept {
@@ -488,10 +406,10 @@ class BasicFileDrain {
     return false;
   }
 
+  DecodeState decode_state_, pending_state_;
   Backend& backend_;
   mutable std::mutex mutex_;
   FileState state_{FileState::kClosed};
-  FileOptions options_{};
   FileStatus status_{};
   RecoveryInfo recovery_{};
   std::uint64_t size_{};

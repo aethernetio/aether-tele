@@ -501,7 +501,7 @@ class RawTeleSink {
       index = static_cast<std::uint32_t>(hash % 65535u) + 1;
     }
     std::lock_guard lock(sites_mutex_);
-    if (index > raw::wire::kMaxTag) {
+    if (index == 0 || index > raw::wire::kMaxTag) {
       sites_valid_ = false;
       ++failures_;
       return {};

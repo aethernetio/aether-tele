@@ -50,188 +50,104 @@ enum class DecodeStatus { kOk, kTruncated, kMalformed };
 struct DecodeResult {
   std::vector<DecodedRecord> records;
   DecodeStatus status{DecodeStatus::kOk};
-  // Prefix safe to keep when repairing an interrupted append before restarting.
+  // Number of bytes consumed by the record reader. No tail repair is performed.
   std::size_t valid_bytes{};
   std::size_t error_offset{};
 };
 
-namespace decode_internal {
-class BlockReader {
- public:
-  BlockReader(std::span<std::uint8_t const> bytes, std::size_t declared,
-              std::size_t prefix_size)
-      : bytes_(bytes), declared_(declared), cursor_(prefix_size) {}
-
-  template <typename Codec>
-  bool Packed(std::uint64_t& value) {
-    if (!ok()) return false;
-    // Zero completion gives the smallest possible width consistent with the
-    // bytes already visible. A declared block too short even for that width
-    // is corrupt, including when its physical tail is also missing.
-    std::array<std::uint8_t, Codec::kMaxWireBytes> prefix{};
-    auto const available = std::min(prefix.size(), bytes_.size() - cursor_);
-    std::copy_n(bytes_.begin() + cursor_, available, prefix.begin());
-    auto const minimum = Codec::WireBytesNeeded(prefix.data(), prefix.size());
-    if (minimum > declared_ - cursor_) return Malformed();
-    auto const status = wire::Read<Codec>(bytes_, cursor_, value);
-    return Accept(status);
-  }
-  bool U64(std::uint64_t& value) {
-    if (!ok()) return false;
-    if (8 > declared_ - cursor_) return Malformed();
-    return Accept(wire::ReadU64(bytes_, cursor_, value));
-  }
-  bool Byte(std::uint8_t& value) {
-    if (!ok()) return false;
-    if (cursor_ >= declared_) return Malformed();
-    if (cursor_ >= bytes_.size()) return Missing();
-    value = bytes_[cursor_++];
-    return true;
-  }
-  bool Bytes(std::uint64_t size, std::span<std::uint8_t const>& value) {
-    if (!ok()) return false;
-    if (size > declared_ - cursor_) return Malformed();
-    if (size > bytes_.size() - cursor_) return Missing();
-    value = bytes_.subspan(cursor_, static_cast<std::size_t>(size));
-    cursor_ += static_cast<std::size_t>(size);
-    return true;
-  }
-  bool Malformed() {
-    status_ = DecodeStatus::kMalformed;
-    return false;
-  }
-  bool ok() const { return status_ == DecodeStatus::kOk; }
-  std::size_t cursor() const { return cursor_; }
-  DecodeStatus status() const { return status_; }
-
- private:
-  bool Missing() {
-    status_ = bytes_.size() < declared_ ? DecodeStatus::kTruncated
-                                        : DecodeStatus::kMalformed;
-    return false;
-  }
-  bool Accept(wire::ReadStatus status) {
-    if (status == wire::ReadStatus::kOk) return true;
-    return status == wire::ReadStatus::kTruncated ? Missing() : Malformed();
-  }
-  std::span<std::uint8_t const> bytes_;
-  std::size_t declared_;
-  std::size_t cursor_{};
-  DecodeStatus status_{DecodeStatus::kOk};
+// State belongs to the byte stream, not to a drain callback or a RAM batch.
+struct DecodeState {
+  std::map<std::uint32_t, std::uint64_t> time;
 };
-
-// A block is the persistence unit. Do not expose any of its rows until its
-// entire declared byte range has arrived and every row has been validated.
-inline DecodeStatus ReadBlock(std::span<std::uint8_t const> bytes,
-                              std::size_t size, std::size_t prefix_size,
-                              std::vector<DecodedRecord>& records) {
-  BlockReader reader(bytes, size, prefix_size);
-  std::uint8_t control{};
-  if (!reader.Byte(control)) return reader.status();
-  auto const fields = wire::Fields(control);
-  auto const kind = control & 3;
-  bool const wide = (control & wire::kWide) != 0;
-  if (!wire::ValidControl(control)) return DecodeStatus::kMalformed;
-  std::uint64_t stream{}, sequence{}, time{};
-  if (!reader.Packed<wire::StreamCodec>(stream)) return reader.status();
-  if (stream > wire::kMaxStream) return DecodeStatus::kMalformed;
-  if (!(wide ? reader.U64(sequence)
-             : reader.Packed<wire::SequenceCodec>(sequence)))
-    return reader.status();
-  if ((fields & kTime) != 0 && !reader.U64(time)) return reader.status();
-  bool any = false;
-  while (reader.cursor() < size) {
-    DecodedRecord record;
-    record.stream = static_cast<std::uint32_t>(stream);
-    record.fields = fields;
-    record.kind = kind == wire::kLogBlock ? Kind::kLog : Kind::kMetric;
-    record.sequence = sequence;
-    std::uint64_t index{};
-    if (!reader.Packed<wire::TagCodec>(index)) return reader.status();
-    if (index > wire::kMaxTag) return DecodeStatus::kMalformed;
-    record.index = static_cast<std::uint32_t>(index);
-    if (kind == wire::kMetricBlock) {
-      Metric metric;
-      bool const ok =
-          wide ? reader.U64(metric.count) && reader.U64(metric.samples) &&
-                     reader.U64(metric.sum) && reader.U64(metric.min) &&
-                     reader.U64(metric.max)
-               : reader.Packed<wire::CountCodec>(metric.count) &&
-                     reader.Packed<wire::CountCodec>(metric.samples) &&
-                     reader.Packed<wire::SumCodec>(metric.sum) &&
-                     reader.Packed<wire::SumCodec>(metric.min) &&
-                     reader.Packed<wire::SumCodec>(metric.max);
-      if (!ok) return reader.status();
-      if (metric.samples != 0 && metric.min > metric.max)
-        return DecodeStatus::kMalformed;
-      record.metric = metric;
-    } else {
-      if ((fields & kTime) != 0) {
-        std::uint64_t code{};
-        if (!reader.Packed<wire::TimeCodec>(code)) return reader.status();
-        if (code > 511) return DecodeStatus::kMalformed;
-        auto const delta = wire::TimeValue(static_cast<std::uint16_t>(code));
-        if (delta > std::numeric_limits<std::uint64_t>::max() - time)
-          return DecodeStatus::kMalformed;
-        time += delta;
-        record.time = time;
-      }
-      if ((fields & kDuration) != 0) {
-        if (!reader.Byte(record.duration_code)) return reader.status();
-        auto const value = wire::DecodeDuration(record.duration_code);
-        record.duration_state = value.state;
-        if (value.state == DurationState::kValue)
-          record.duration = value.microseconds;
-      }
-      if ((fields & kPayload) != 0) {
-        std::uint64_t length{};
-        if (!reader.Packed<wire::BlobCodec>(length) ||
-            !reader.Bytes(length, record.payload))
-          return reader.status();
-      }
-    }
-    records.push_back(record);
-    any = true;
-    if (reader.cursor() < size) {
-      if (sequence == std::numeric_limits<std::uint64_t>::max())
-        return DecodeStatus::kMalformed;
-      ++sequence;
-    }
-  }
-  if (!any) return DecodeStatus::kMalformed;
-  return bytes.size() < size ? DecodeStatus::kTruncated : DecodeStatus::kOk;
-}
-}  // namespace decode_internal
-
-inline DecodeResult Decode(std::span<std::uint8_t const> input) {
+inline DecodeResult Decode(std::span<std::uint8_t const> input,
+                           DecodeState& state) {
   DecodeResult result;
-  while (result.valid_bytes < input.size()) {
-    auto const remaining = input.subspan(result.valid_bytes);
-    result.error_offset = result.valid_bytes;
-    std::size_t prefix_size = 0;
-    std::uint64_t size = 0;
-    auto const prefix_status =
-        wire::Read<wire::BlockSizeCodec>(remaining, prefix_size, size);
-    if (prefix_status != wire::ReadStatus::kOk) {
-      result.status = prefix_status == wire::ReadStatus::kTruncated
-                          ? DecodeStatus::kTruncated
-                          : DecodeStatus::kMalformed;
-      return result;
+  std::size_t cursor = 0;
+  auto packed = [&]<typename Codec>(std::uint64_t& value) {
+    return wire::Read<Codec>(input, cursor, value) == wire::ReadStatus::kOk;
+  };
+  auto u64 = [&](std::uint64_t& value) {
+    return wire::ReadU64(input, cursor, value) == wire::ReadStatus::kOk;
+  };
+  auto fail = [&]() {
+    result.status = DecodeStatus::kMalformed;
+    return result;
+  };
+  while (cursor < input.size()) {
+    result.error_offset = cursor;
+    std::uint64_t index{}, stream{};
+    if (!packed.template operator()<wire::TagCodec>(index)) return fail();
+    if (index == 0) {
+      std::uint64_t absolute{};
+      if (!packed.template operator()<wire::StreamCodec>(stream) ||
+          !u64(absolute))
+        return fail();
+      state.time[static_cast<std::uint32_t>(stream)] = absolute;
+      result.valid_bytes = cursor;
+      continue;
     }
-    if (size < kMinBlockSize || size < prefix_size) {
-      result.status = DecodeStatus::kMalformed;
-      return result;
+    if (cursor == input.size()) return fail();
+    auto const control = input[cursor++];
+    if (!wire::ValidControl(control)) return fail();
+    bool const wide = (control & wire::kWide) != 0;
+    DecodedRecord record;
+    record.index = static_cast<std::uint32_t>(index);
+    record.fields = wire::Fields(control);
+    record.kind = (control & 3) == 0 ? Kind::kLog : Kind::kMetric;
+    if (!packed.template operator()<wire::StreamCodec>(stream)) return fail();
+    record.stream = static_cast<std::uint32_t>(stream);
+    if (!(wide ? u64(record.sequence)
+               : packed.template operator()<wire::SequenceCodec>(
+                     record.sequence)))
+      return fail();
+    if (record.kind == Kind::kMetric) {
+      Metric m;
+      bool ok =
+          wide ? u64(m.count) && u64(m.samples) && u64(m.sum) && u64(m.min) &&
+                     u64(m.max)
+               : packed.template operator()<wire::CountCodec>(m.count) &&
+                     packed.template operator()<wire::CountCodec>(m.samples) &&
+                     packed.template operator()<wire::SumCodec>(m.sum) &&
+                     packed.template operator()<wire::SumCodec>(m.min) &&
+                     packed.template operator()<wire::SumCodec>(m.max);
+      if (!ok) return fail();
+      record.metric = m;
+    } else {
+      if (record.fields & kTime) {
+        std::uint64_t delta{};
+        auto found = state.time.find(record.stream);
+        if (found == state.time.end() ||
+            !packed.template operator()<wire::TimeCodec>(delta))
+          return fail();
+        found->second += wire::TimeValue(static_cast<std::uint16_t>(delta));
+        record.time = found->second;
+      }
+      if (record.fields & kDuration) {
+        if (cursor == input.size()) return fail();
+        record.duration_code = input[cursor++];
+        auto duration = wire::DecodeDuration(record.duration_code);
+        record.duration_state = duration.state;
+        if (duration.known()) record.duration = duration.microseconds;
+      }
+      if (record.fields & kPayload) {
+        std::uint64_t length{};
+        if (!packed.template operator()<wire::BlobCodec>(length) ||
+            length > input.size() - cursor)
+          return fail();
+        record.payload =
+            input.subspan(cursor, static_cast<std::size_t>(length));
+        cursor += static_cast<std::size_t>(length);
+      }
     }
-    std::vector<DecodedRecord> block;
-    result.status = decode_internal::ReadBlock(
-        remaining.first(std::min<std::size_t>(size, remaining.size())), size,
-        prefix_size, block);
-    if (result.status != DecodeStatus::kOk) return result;
-    result.records.insert(result.records.end(), block.begin(), block.end());
-    result.valid_bytes += size;
+    result.records.push_back(record);
+    result.valid_bytes = cursor;
   }
-  result.error_offset = result.valid_bytes;
+  result.error_offset = cursor;
   return result;
+}
+inline DecodeResult Decode(std::span<std::uint8_t const> input) {
+  DecodeState state;
+  return Decode(input, state);
 }
 struct Reconstruction {
   std::vector<DecodedRecord> records;

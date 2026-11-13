@@ -21,11 +21,9 @@ enum Field : std::uint32_t {
 };
 // Removed bits are invalid; never reinterpret an old capture's fields.
 inline constexpr std::uint32_t kAllFields = kTime | kDuration | kPayload;
-// Smallest block header: size:1 byte, control:u8, stream:1 byte, sequence:2
-// bytes.
+// Minimum ordinary record: tag, control, writer, sequence.
 inline constexpr std::size_t kHeaderSize = 5;
-// Every block has at least one row, whose smallest representation is one tag.
-inline constexpr std::size_t kMinBlockSize = kHeaderSize + 1;
+
 enum class Kind : std::uint32_t { kLog, kMetric };
 
 enum class DurationState { kBelowMin, kValue, kAboveMax, kUnknown };
@@ -82,11 +80,20 @@ class Space {
   Space(Space const&) = delete;
   Space& operator=(Space const&) = delete;
   void SetRuntime(Options options) {
-    runtime_.store(PackOptions(Restrict(options, Compiled)),
-                   std::memory_order_release);
+    auto previous = runtime_.load(std::memory_order_relaxed);
+    std::uint32_t next;
+    do {
+      next = ((previous + 0x1000u) & 0xfffff000u) |
+             PackOptions(Restrict(options, Compiled));
+    } while (!runtime_.compare_exchange_weak(previous, next,
+                                             std::memory_order_release));
   }
   Options Runtime() const {
     return UnpackOptions(runtime_.load(std::memory_order_acquire));
+  }
+
+  std::uint64_t RuntimeEpoch() const {
+    return runtime_.load(std::memory_order_acquire) >> 12;
   }
 
  private:
@@ -106,9 +113,11 @@ struct Tag {
 };
 template <typename TagT, std::size_t N>
 constexpr bool UniqueIndices(TagT const (&tags)[N]) {
-  for (std::size_t i = 0; i < N; ++i)
+  for (std::size_t i = 0; i < N; ++i) {
+    if (tags[i].index == 0) return false;
     for (std::size_t j = i + 1; j < N; ++j)
-      if (tags[i].index == tags[j].index) return false;
+      if (tags[i].index == 0 || tags[i].index == tags[j].index) return false;
+  }
   return true;
 }
 struct Data {

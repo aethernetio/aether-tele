@@ -3,9 +3,8 @@
 """Decode raw tele files with their matching debug-build map into JSON lines.
 
 This tool has no magic/checksum/build autodetection. Keep data from different
-spaces/builds separate, and select the correct map explicitly. A trailing
-interrupted block is ignored with a diagnostic; malformed complete blocks fail.
-Before appending to an interrupted file, truncate it to the reported valid_bytes.
+spaces/builds separate, and select the correct map explicitly.
+Input is a continuous flat stream; no interrupted-write recovery is performed.
 """
 
 from __future__ import annotations
@@ -18,10 +17,8 @@ import struct
 import sys
 
 
-MINIMUM_BLOCK_BYTES = 6
 MAX_U64 = (1 << 64) - 1
 CODECS = {
-    "block_size": (1, (250, 1500), None),
     "tag": (1, (239, 4095), 65535),
     "stream": (1, (15, 1023), 65535),
     "sequence": (2, (32767, 2_000_000_000), None),
@@ -64,13 +61,13 @@ def _encode_packed(value: int, base: int, thresholds: tuple[int, ...]) -> bytes:
     return bytes(out[:size])
 
 
-class _BlockReader:
+class _RecordReader:
     def __init__(self, data: bytes, size: int, cursor: int = 0):
         self.data, self.size, self.cursor = data, size, cursor
 
     def take(self, count: int) -> bytes:
         if count > self.size - self.cursor:
-            raise DecodeError("field exceeds declared block size")
+            raise DecodeError("record is incomplete")
         if count > len(self.data) - self.cursor:
             raise _Missing
         start = self.cursor
@@ -108,22 +105,28 @@ def _table(metadata: dict | None, name: str, length: int) -> list[int]:
     return values
 
 
-def _decode_block(data: bytes, size: int, prefix_size: int, metadata: dict | None) -> list[dict]:
-    reader = _BlockReader(data, size, prefix_size)
-    control = reader.number(1)
-    kind, flags, wide = control & 3, (control & 0x2c) >> 2, bool(control & 128)
-    if control & ~0xaf or kind > 1 or (kind == 1 and flags):
-        raise DecodeError(f"invalid block control {control:#x}")
-    stream = reader.packed("stream")
-    sequence = reader.number(8) if wide else reader.packed("sequence")
-    timestamp = reader.number(8) if flags & 1 else 0
+def decode(data: bytes, metadata: dict | None = None, times: dict | None = None) -> tuple[list[dict], int, bool]:
+    """Decode a normal flat stream. Supply the same times for successive chunks."""
+    reader = _RecordReader(data, len(data))
+    times = {} if times is None else times
     records = []
-    time_values = None
-    duration_values = None
-    while reader.cursor < size:
-        record = {"index": reader.packed("tag"), "stream": stream,
-                  "fields": flags, "sequence": sequence,
-                  "kind": "log" if kind == 0 else "metric"}
+    time_values = duration_values = None
+    while reader.cursor < len(data):
+        index = reader.packed("tag")
+        if index == 0:
+            stream = reader.packed("stream")
+            times[stream] = reader.number(8)
+            continue
+        control = reader.number(1)
+        kind, flags, wide = control & 3, (control & 0x2c) >> 2, bool(control & 128)
+        if control & ~0xaf or kind > 1 or (kind == 1 and flags):
+            raise DecodeError("invalid record control")
+        stream = reader.packed("stream")
+        sequence = reader.number(8) if wide else reader.packed("sequence")
+        if flags & 1 and stream not in times:
+            raise DecodeError("time anchor missing for writer")
+        record = {"index": index, "stream": stream, "fields": flags,
+                  "sequence": sequence, "kind": "log" if kind == 0 else "metric"}
         if kind == 1:
             names = ("count", "samples", "sum", "min", "max")
             values = [reader.number(8) if wide else reader.packed(codec)
@@ -137,7 +140,8 @@ def _decode_block(data: bytes, size: int, prefix_size: int, metadata: dict | Non
                 code = reader.packed("time")
                 if time_values is None:
                     time_values = _table(metadata, "time_values_us", 512)
-                timestamp += time_values[code]
+                timestamp = times[stream] + time_values[code]
+                times[stream] = timestamp
                 if timestamp > MAX_U64:
                     raise DecodeError("timestamp delta overflows u64")
                 record["time_us"] = timestamp
@@ -158,47 +162,7 @@ def _decode_block(data: bytes, size: int, prefix_size: int, metadata: dict | Non
             if flags & 8:
                 record["payload_hex"] = reader.take(reader.packed("blob")).hex()
         records.append(record)
-        if reader.cursor < size:
-            if sequence == MAX_U64:
-                raise DecodeError("row sequence overflows u64")
-            sequence += 1
-    if not records:
-        raise DecodeError("empty telemetry block")
-    return records
-
-
-def decode(data: bytes, metadata: dict | None = None) -> tuple[list[dict], int, bool]:
-    """Return rows, complete-block prefix size, and interrupted-tail status.
-
-    A torn block contributes no rows. Time and interior duration codes require
-    the exact lookup tables exported with the matching application-build map.
-    """
-    records: list[dict] = []
-    pos = 0
-    while pos < len(data):
-        prefix = _BlockReader(data[pos:pos + 4], 4)
-        try:
-            size = prefix.packed("block_size")
-        except _Missing:
-            return records, pos, True
-        except DecodeError as error:
-            raise DecodeError(f"block at {pos}: {error}") from error
-        if size < MINIMUM_BLOCK_BYTES:
-            raise DecodeError(f"block at {pos}: size {size} is below minimum")
-        available = data[pos:pos + size]
-        try:
-            block = _decode_block(available, size, prefix.cursor, metadata)
-        except _Missing:
-            if size > len(available):
-                return records, pos, True
-            raise DecodeError(f"block at {pos}: incomplete field in complete block") from None
-        except DecodeError as error:
-            raise DecodeError(f"block at {pos}: {error}") from error
-        if size > len(available):
-            return records, pos, True
-        records.extend(block)
-        pos += size
-    return records, pos, False
+    return records, len(data), False
 
 def merge_records(records: list[dict]) -> list[dict]:
     """Merge writer heads, preserving append order across sequence resets.
@@ -239,8 +203,8 @@ def merge_records(records: list[dict]) -> list[dict]:
 def load_map(path: Path) -> dict:
     metadata = json.loads(path.read_text(encoding="utf-8"))
     if (metadata.get("byte_order") != "little" or
-            metadata.get("layout") != "compact_blocks" or
-            metadata.get("minimum_block_bytes") != MINIMUM_BLOCK_BYTES):
+            metadata.get("layout") != "flat_records" or
+            metadata.get("absolute_time_tag") != 0):
         raise DecodeError("map does not describe the current compact raw tele layout")
     if metadata.get("fields") != FIELDS:
         raise DecodeError("map does not describe the current raw event fields")
@@ -256,7 +220,7 @@ def load_map(path: Path) -> dict:
     tags = metadata.get("tags", [])
     seen = set()
     for tag in tags:
-        if type(tag["index"]) is not int or not 0 <= tag["index"] <= 65535:
+        if type(tag["index"]) is not int or not 1 <= tag["index"] <= 65535:
             raise DecodeError(f"invalid map index {tag['index']}")
         if tag["index"] in seen:
             raise DecodeError(f"duplicate map index {tag['index']}")
@@ -334,14 +298,13 @@ def main(argv: list[str] | None = None) -> int:
         tags = {tag["index"]: tag for tag in metadata["tags"]}
         records = []
         seen_paths = set()
+        times = {}
         for path in args.files:
             canonical = os.path.normcase(str(path.resolve()))
             if canonical in seen_paths:
                 raise DecodeError(f"capture file supplied twice: {path}")
             seen_paths.add(canonical)
-            decoded, valid_bytes, truncated = decode(path.read_bytes(), metadata)
-            if truncated:
-                print(f"{path}: interrupted tail ignored; valid_bytes={valid_bytes}", file=sys.stderr)
+            decoded, valid_bytes, truncated = decode(path.read_bytes(), metadata, times)
             records.extend(decoded)
         if not args.metrics and any("time_us" not in record for record in records):
             print("Some timestamps are disabled: only per-writer order is recoverable; "

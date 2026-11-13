@@ -24,8 +24,8 @@
 #include "aether-tele/raw/wire.h"
 
 namespace ae::tele::raw {
-// A Stream has one owner. Each callback accepts a complete immutable block.
-// No destructor IO; drain explicitly while callback/context are alive.
+// A Stream has one owner. Each callback accepts a contiguous span of complete
+// records. No destructor IO; drain explicitly while callback/context are alive.
 template <class SpaceT, std::size_t Capacity = 4096,
           std::size_t MetricCapacity = 128>
 class Stream {
@@ -35,8 +35,6 @@ class Stream {
   static constexpr std::size_t kMetricCapacity = MetricCapacity;
   static_assert(Capacity >= kHeaderSize);
   static_assert(Capacity <= std::numeric_limits<std::uint32_t>::max());
-  static_assert(Capacity <= std::numeric_limits<std::size_t>::max() -
-                                wire::kBlockPrefixSlack);
   struct DurationTicket {
     std::uint64_t generation{};
     std::size_t offset{};
@@ -65,7 +63,7 @@ class Stream {
     if (busy_ || restore_closed_ || totals.size() > MetricCapacity)
       return false;
     for (std::size_t i = 0; i < totals.size(); ++i) {
-      if (totals[i].index > wire::kMaxTag ||
+      if (totals[i].index == 0 || totals[i].index > wire::kMaxTag ||
           (totals[i].metric.samples &&
            totals[i].metric.min > totals[i].metric.max))
         return false;
@@ -90,28 +88,33 @@ class Stream {
     if (!snapshot.logs && !to_console) return true;
     restore_closed_ = true;
     if (busy_ || sequence_exhausted_ || stream_id_ > wire::kMaxStream ||
-        tag.index > wire::kMaxTag || kind != Kind::kLog) {
+        tag.index == 0 || tag.index > wire::kMaxTag || kind != Kind::kLog) {
       Increment(dropped_);
       return false;
     }
     BusyGuard guard{busy_};
     auto const fields = snapshot.fields;
     auto const sequence = sequence_;
-    // First encode a standalone block, copying ALL incoming payload before IO.
-    // The same scratch block is also an independently decodable console event.
+    // Each record is independent of RAM batching. Only time bases carry tag 0.
+    auto const epoch = space_.RuntimeEpoch();
+    bool const anchor =
+        (fields & kTime) &&
+        (!time_valid_ || epoch != time_epoch_ || timestamp < last_time_ ||
+         timestamp - last_time_ > wire::kMaxTimeDeltaUs);
+    auto const previous_time = last_time_;
+    std::uint16_t delta = 0;
+    if ((fields & kTime) && !anchor)
+      delta = wire::EncodeTime(timestamp - last_time_);
     std::size_t cursor = 0;
-    std::size_t row{}, time_at{}, duration_at{};
+    if (anchor && !TimeAnchor(scratch_, cursor, timestamp)) return Drop();
     bool const wide = sequence > wire::SequenceCodec::kUpper;
-    if (!Header(scratch_, cursor, wire::kLogBlock, fields, wide, sequence,
-                timestamp))
+    if (!wire::Write<wire::TagCodec>(tag.index, scratch_, cursor) ||
+        !Header(scratch_, cursor, wire::kLogRecord, fields, wide, sequence, 0))
       return Drop();
-    row = cursor;
-    if (!wire::Write<wire::TagCodec>(tag.index, scratch_, cursor))
+    if ((fields & kTime) &&
+        !wire::Write<wire::TimeCodec>(delta, scratch_, cursor))
       return Drop();
-    time_at = cursor;
-    if ((fields & kTime) && !wire::Write<wire::TimeCodec>(0, scratch_, cursor))
-      return Drop();
-    duration_at = cursor;
+    auto const duration_at = cursor;
     if (fields & kDuration) {
       if (cursor == scratch_.size()) return Drop();
       scratch_[cursor++] =
@@ -127,78 +130,39 @@ class Stream {
                     data.payload.size());
       cursor += data.payload.size();
     }
-    auto const standalone_size = cursor;
-    auto const console_bytes = wire::FinishBlock(scratch_, cursor, Capacity);
-    if (console_bytes.empty()) return Drop();
-    bool success = true, persisted = false;
+    if (cursor > Capacity) return Drop();
+    bool success = true;
     if (snapshot.logs) {
-      bool append = used_ && !frozen_ && fields == fields_ && !wide_ && !wide &&
-                    sequence == next_block_sequence_;
-      std::uint16_t dt = 0;
-      if (append && (fields & kTime)) {
-        append = timestamp >= last_time_ &&
-                 timestamp - last_time_ <= wire::kMaxTimeDeltaUs;
-        if (append) dt = wire::EncodeTime(timestamp - last_time_);
-      }
-      std::array<std::uint8_t, 4> dt_bytes{};
-      std::size_t dt_size = 0;
-      if (fields & kTime) {
-        if (!wire::Write<wire::TimeCodec>(dt, dt_bytes, dt_size)) return Drop();
-      }
-      auto const row_size =
-          standalone_size - row + ((fields & kTime) ? dt_size - 1 : 0);
-      auto const appended_size = wire::BlockWireSize(
-          used_ ? used_ - wire::kBlockPrefixReserve + row_size : 0);
-      if (append && (!appended_size || appended_size > Capacity ||
-                     row_size > bytes_.size() - used_ ||
-                     ((fields & kTime) &&
-                      dt_size - 1 > scratch_.size() - standalone_size)))
-        append = false;
-      if (!append && used_ && !DrainPending()) {
+      if ((frozen_ || cursor > Capacity - used_) && !DrainPending()) {
         success = false;
         Increment(dropped_);
       } else {
-        if (append) {
-          // Variable time code is inserted only in the private scratch arena.
-          if ((fields & kTime) && dt_size > 1)
-            std::memmove(scratch_.data() + time_at + dt_size,
-                         scratch_.data() + time_at + 1,
-                         standalone_size - time_at - 1);
-          if (fields & kTime)
-            std::memcpy(scratch_.data() + time_at, dt_bytes.data(), dt_size);
-          auto const offset = used_;
-          std::memcpy(bytes_.data() + used_, scratch_.data() + row, row_size);
-          used_ += row_size;
-          if (ticket && (fields & kDuration) && !slots_disabled_)
-            *ticket = {generation_,
-                       offset + duration_at - row +
-                           ((fields & kTime) ? dt_size - 1 : 0),
-                       true, this};
-          if (fields & kTime) last_time_ += wire::TimeValue(dt);
-          // Restore standalone scratch for the console without reading caller
-          // data.
-          if ((fields & kTime) && dt_size > 1)
-            std::memmove(scratch_.data() + time_at + 1,
-                         scratch_.data() + time_at + dt_size,
-                         standalone_size - time_at - 1);
-          if (fields & kTime) scratch_[time_at] = 0;
-        } else {
-          std::memcpy(bytes_.data(), scratch_.data(), standalone_size);
-          used_ = standalone_size;
-          fields_ = fields;
-          wide_ = wide;
-          frozen_ = false;
-          last_time_ = timestamp;
-          if (ticket && (fields & kDuration) && !slots_disabled_)
-            *ticket = {generation_, duration_at, true, this};
+        auto const offset = used_;
+        std::memcpy(bytes_.data() + used_, scratch_.data(), cursor);
+        used_ += cursor;
+        if (ticket && (fields & kDuration) && !slots_disabled_)
+          *ticket = {generation_, offset + duration_at, true, this};
+        if (fields & kTime) {
+          last_time_ = anchor ? timestamp : last_time_ + wire::TimeValue(delta);
+          time_valid_ = true;
+          time_epoch_ = epoch;
         }
-        auto const block = wire::FinishBlock(bytes_, used_, Capacity);
-        wire_start_ = static_cast<std::size_t>(block.data() - bytes_.data());
-        next_block_sequence_ = sequence == UINT64_MAX ? sequence : sequence + 1;
-        persisted = true;
       }
     }
-    if (persisted || to_console) AdvanceSequence();
+    // Console callbacks receive a standalone time anchor, without changing
+    // the persisted writer's time base or introducing drain boundaries.
+    auto console_size = cursor;
+    if (to_console && (fields & kTime) && !anchor) {
+      std::array<std::uint8_t, 16> prefix{};
+      std::size_t prefix_size = 0;
+      if (!TimeAnchor(prefix, prefix_size, previous_time)) return Drop();
+      std::memmove(scratch_.data() + prefix_size, scratch_.data(), cursor);
+      std::memcpy(scratch_.data(), prefix.data(), prefix_size);
+      console_size += prefix_size;
+    }
+    auto const console_bytes =
+        std::span<std::uint8_t const>{scratch_}.first(console_size);
+    if (success || to_console) AdvanceSequence();
     if (to_console) {
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
       try {
@@ -248,8 +212,7 @@ class Stream {
     return true;
   }
   std::span<std::uint8_t const> pending() const noexcept {
-    return used_ ? std::span<std::uint8_t const>{bytes_.data() + wire_start_,
-                                                 used_ - wire_start_}
+    return used_ ? std::span<std::uint8_t const>{bytes_.data(), used_}
                  : std::span<std::uint8_t const>{};
   }
   std::uint64_t dropped() const noexcept { return dropped_; }
@@ -330,7 +293,7 @@ class Stream {
     return false;
   }
   Entry* FindOrInsert(std::uint32_t index) noexcept {
-    if (busy_ || index > wire::kMaxTag) {
+    if (busy_ || index == 0 || index > wire::kMaxTag) {
       Increment(metric_overflow_);
       return nullptr;
     }
@@ -349,19 +312,20 @@ class Stream {
   }
   bool Header(std::span<std::uint8_t> out, std::size_t& cursor,
               std::uint8_t kind, std::uint32_t fields, bool wide,
-              std::uint64_t sequence, std::uint64_t base) noexcept {
-    if (out.size() < wire::kBlockPrefixReserve + 1 ||
-        stream_id_ > wire::kMaxStream)
-      return false;
-    cursor = wire::kBlockPrefixReserve;
+              std::uint64_t sequence, std::uint64_t /*base*/) noexcept {
+    if (cursor >= out.size() || stream_id_ > wire::kMaxStream) return false;
     out[cursor++] = wire::Control(kind, fields, wide);
     if (!wire::Write<wire::StreamCodec>(stream_id_, out, cursor)) return false;
-    if (wide) {
-      if (!wire::WriteU64(sequence, out, cursor)) return false;
-    } else if (!wire::Write<wire::SequenceCodec>(sequence, out, cursor))
-      return false;
-    return !(fields & kTime) || wire::WriteU64(base, out, cursor);
+    return wide ? wire::WriteU64(sequence, out, cursor)
+                : wire::Write<wire::SequenceCodec>(sequence, out, cursor);
   }
+  bool TimeAnchor(std::span<std::uint8_t> out, std::size_t& cursor,
+                  std::uint64_t time) noexcept {
+    return wire::Write<wire::TagCodec>(0, out, cursor) &&
+           wire::Write<wire::StreamCodec>(stream_id_, out, cursor) &&
+           wire::WriteU64(time, out, cursor);
+  }
+
   bool DrainMetricRetry(Entry& e) noexcept {
     if (!drain_) return false;
     auto const& m = e.retry;
@@ -371,15 +335,14 @@ class Stream {
                 m.sum > wire::SumCodec::kUpper ||
                 m.min > wire::SumCodec::kUpper ||
                 m.max > wire::SumCodec::kUpper;
-    constexpr auto kMetricBlockCapacity =
-        wire::kBlockPrefixReserve + 1 + wire::StreamCodec::kMaxWireBytes +
-        sizeof(std::uint64_t) + wire::TagCodec::kMaxWireBytes +
-        5 * sizeof(std::uint64_t);
-    std::array<std::uint8_t, kMetricBlockCapacity> frame{};
+    constexpr auto kMetricRecordCapacity =
+        1 + wire::StreamCodec::kMaxWireBytes + sizeof(std::uint64_t) +
+        wire::TagCodec::kMaxWireBytes + 5 * sizeof(std::uint64_t);
+    std::array<std::uint8_t, kMetricRecordCapacity> frame{};
     std::size_t cursor = 0;
-    if (!Header(frame, cursor, wire::kMetricBlock, 0, wide, e.retry_sequence,
-                0) ||
-        !wire::Write<wire::TagCodec>(e.index, frame, cursor))
+    if (!wire::Write<wire::TagCodec>(e.index, frame, cursor) ||
+        !Header(frame, cursor, wire::kMetricRecord, 0, wide, e.retry_sequence,
+                0))
       return false;
     if (wide) {
       for (auto n : {m.count, m.samples, m.sum, m.min, m.max})
@@ -390,12 +353,12 @@ class Stream {
                !wire::Write<wire::SumCodec>(m.min, frame, cursor) ||
                !wire::Write<wire::SumCodec>(m.max, frame, cursor))
       return false;
-    auto const block = wire::FinishBlock(frame, cursor);
-    if (block.empty()) return false;
+    auto const record = std::span<std::uint8_t const>{frame}.first(cursor);
+    if (record.empty()) return false;
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
 #endif
-      if (!drain_(drain_context_, block)) return false;
+      if (!drain_(drain_context_, record)) return false;
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     } catch (...) {
       return false;
@@ -438,15 +401,15 @@ class Stream {
   void* drain_context_;
   ConsoleCallback console_;
   void* console_context_;
-  std::array<std::uint8_t, Capacity + wire::kBlockPrefixSlack> bytes_{},
-      scratch_{};
+  std::array<std::uint8_t, Capacity> bytes_{};
+  std::array<std::uint8_t, Capacity + 16> scratch_{};
   std::array<Entry, MetricCapacity> metrics_{};
-  std::size_t used_{}, wire_start_{};
+  std::size_t used_{};
   std::uint64_t sequence_{}, dropped_{}, metric_overflow_{},
       console_failures_{};
-  std::uint64_t generation_{1}, last_time_{}, next_block_sequence_{};
-  std::uint32_t fields_{};
-  bool busy_{}, sequence_exhausted_{}, restore_closed_{}, frozen_{}, wide_{},
+  std::uint64_t generation_{1}, last_time_{}, time_epoch_{};
+  bool time_valid_{};
+  bool busy_{}, sequence_exhausted_{}, restore_closed_{}, frozen_{},
       slots_disabled_{};
 };
 }  // namespace ae::tele::raw

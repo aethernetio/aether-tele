@@ -50,11 +50,11 @@ auto MakeScope(StreamT& stream, TagT tag, Register&& register_site) {
 
 #define AE_RAW_CAT_(A, B) A##B
 #define AE_RAW_CAT(A, B) AE_RAW_CAT_(A, B)
-#define AE_RAW_TAG(SPACE, NAME, INDEX, MODULE, LEVEL, TEXT)  \
-  static_assert((INDEX) >= 0 && (INDEX) <= 65535,            \
-                "telemetry tag index exceeds 16-bit range"); \
-  inline constexpr ::ae::tele::raw::Tag<SPACE> NAME {        \
-    INDEX, MODULE, LEVEL, #NAME, TEXT, __FILE__, __LINE__    \
+#define AE_RAW_TAG(SPACE, NAME, INDEX, MODULE, LEVEL, TEXT)                \
+  static_assert((INDEX) > 0 && (INDEX) <= 65535,                           \
+                "telemetry tag index must be 1..65535; zero is reserved"); \
+  inline constexpr ::ae::tele::raw::Tag<SPACE> NAME {                      \
+    INDEX, MODULE, LEVEL, #NAME, TEXT, __FILE__, __LINE__                  \
   }
 
 #if defined(AE_TELE_RAW_DEBUG) && AE_TELE_RAW_DEBUG
