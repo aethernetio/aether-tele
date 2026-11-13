@@ -21,7 +21,7 @@ void Log(StreamT& stream, Tag<typename StreamT::SpaceType> tag, Options options,
           timestamp = SpaceT::ClockType::TimestampUs();
         }
       }
-      // Preserve the configured block mask for instant events too: an untimed
+      // Preserve the configured field mask for instant events too: an untimed
       // event carries the unknown duration code instead of forcing a drain of
       // surrounding live scopes solely because their duration field is present.
       typename StreamT::DurationTicket unused;
@@ -31,7 +31,7 @@ void Log(StreamT& stream, Tag<typename StreamT::SpaceType> tag, Options options,
 }
 
 // Flat inclusive duration. Reserve one byte at entry and patch it on exit only
-// while the original block remains mutable. Drain permanently invalidates
+// while the original RAM remains mutable. Drain permanently invalidates
 // tickets.
 template <typename StreamT>
 class Scope {

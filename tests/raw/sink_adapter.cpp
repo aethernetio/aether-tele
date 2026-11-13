@@ -314,19 +314,19 @@ void test_canonical_query_saturates_without_adding_restored_totals_twice() {
   auto& sink = Sink<12>::Instance();
   auto maximum = std::numeric_limits<std::uint64_t>::max();
   std::array<std::uint8_t, 128> bytes{};
-  auto cursor = ae::tele::raw::wire::kBlockPrefixReserve;
+  std::size_t cursor = 0;
+  TEST_ASSERT_TRUE(ae::tele::raw::wire::Write<ae::tele::raw::wire::TagCodec>(
+      1, bytes, cursor));
   bytes[cursor++] =
-      ae::tele::raw::wire::Control(ae::tele::raw::wire::kMetricBlock, 0, true);
+      ae::tele::raw::wire::Control(ae::tele::raw::wire::kMetricRecord, 0, true);
   TEST_ASSERT_TRUE(ae::tele::raw::wire::Write<ae::tele::raw::wire::StreamCodec>(
       0, bytes, cursor));
   TEST_ASSERT_TRUE(ae::tele::raw::wire::WriteU64(0, bytes, cursor));
-  TEST_ASSERT_TRUE(ae::tele::raw::wire::Write<ae::tele::raw::wire::TagCodec>(
-      1, bytes, cursor));
   for (auto value :
        {maximum, maximum, maximum, std::uint64_t{1}, std::uint64_t{2}})
     TEST_ASSERT_TRUE(ae::tele::raw::wire::WriteU64(value, bytes, cursor));
   TEST_ASSERT_TRUE(backend->Append(
-      "adapter", ae::tele::raw::wire::FinishBlock(bytes, cursor)));
+      "adapter", std::span<std::uint8_t const>{bytes}.first(cursor)));
   TEST_ASSERT_TRUE(sink.SetBackend(backend));
   TEST_ASSERT_TRUE(sink.BindWriter(0));
   Emit<Sink<12>>();

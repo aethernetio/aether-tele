@@ -44,7 +44,6 @@ using SumCodec = SequenceCodec;
 // Approved blob-length tiers: 0..250 -> 1 byte, 251..1500 -> 2 bytes,
 // 1501..1'967'580 -> 4 bytes. The final maximum is derived by numeric.
 using BlobCodec = ae::TieredInt<std::uint8_t, 250, 1500>;
-using BlockSizeCodec = BlobCodec;
 using TimeCodec = ae::TieredInt<std::uint8_t, 250, 511>;
 using DurationCodec = ae::TieredInt<std::uint8_t, 253>;
 using RuntimeSeconds = ae::FixedPoint<std::uint32_t, 64.0>;
@@ -52,13 +51,8 @@ using DurationExp =
     ae::Exponential<RuntimeSeconds, DurationCodec, 0.000001, 60.0, 253>;
 using TimeExp = ae::Exponential<RuntimeSeconds, TimeCodec, 0.000001, 60.0, 511>;
 
-// Keep bodies at a stable offset in RAM as the serialized size prefix grows.
-// The unused leading bytes are never included in pending()/callbacks/files.
-inline constexpr std::size_t kBlockPrefixReserve =
-    BlockSizeCodec::kMaxWireBytes;
-inline constexpr std::size_t kBlockPrefixSlack = kBlockPrefixReserve - 1;
-inline constexpr std::uint8_t kLogBlock = 0;
-inline constexpr std::uint8_t kMetricBlock = 1;
+inline constexpr std::uint8_t kLogRecord = 0;
+inline constexpr std::uint8_t kMetricRecord = 1;
 inline constexpr std::uint8_t kWide = 0x80;
 inline constexpr std::uint32_t kMaxTag = 65535;
 inline constexpr std::uint32_t kMaxStream = 65535;
@@ -85,8 +79,8 @@ constexpr bool ValidControl(std::uint8_t control) noexcept {
   constexpr auto allowed =
       static_cast<std::uint8_t>(3 | (kAllFields << 2) | kWide);
   auto const kind = control & 3;
-  return (control & ~allowed) == 0 && kind <= kMetricBlock &&
-         (kind != kMetricBlock || Fields(control) == 0);
+  return (control & ~allowed) == 0 && kind <= kMetricRecord &&
+         (kind != kMetricRecord || Fields(control) == 0);
 }
 
 template <typename Codec>
@@ -142,33 +136,6 @@ ReadStatus Read(std::span<std::uint8_t const> input, std::size_t& cursor,
   cursor += count;
   value = number;
   return ReadStatus::kOk;
-}
-
-// Size includes its own variable-width prefix. Choose the smallest stable
-// width: crossing 250/1500 can add more than one byte to the total block size.
-inline std::size_t BlockWireSize(std::size_t body_size) noexcept {
-  for (std::size_t width : {std::size_t{1}, std::size_t{2}, std::size_t{4}}) {
-    if (body_size > BlockSizeCodec::kUpper - width) return 0;
-    auto const total = body_size + width;
-    if (Size<BlockSizeCodec>(total) == width) return total;
-  }
-  return 0;
-}
-
-// Body starts at kBlockPrefixReserve. Only the prefix is written here, so
-// outstanding duration offsets remain valid across prefix-width transitions.
-// Invalid/oversize input leaves storage unchanged.
-inline std::span<std::uint8_t const> FinishBlock(
-    std::span<std::uint8_t> storage, std::size_t end,
-    std::size_t capacity = BlockSizeCodec::kUpper) noexcept {
-  if (end < kBlockPrefixReserve || end > storage.size()) return {};
-  auto const body_size = end - kBlockPrefixReserve;
-  auto const total = BlockWireSize(body_size);
-  if (!total || total > capacity) return {};
-  auto const start = kBlockPrefixReserve - (total - body_size);
-  auto cursor = start;
-  if (!Write<BlockSizeCodec>(total, storage, cursor)) return {};
-  return storage.subspan(start, total);
 }
 
 inline bool WriteU64(std::uint64_t value, std::span<std::uint8_t> out,

@@ -57,11 +57,12 @@ class MemoryBackend final : public IBackend {
  public:
   bool Append(std::string_view space,
               std::span<std::uint8_t const> bytes) override {
-    auto decoded = Decode(bytes);
-    if (decoded.status != DecodeStatus::kOk) return false;
     std::lock_guard lock(mutex_);
+    auto state = decode_states_[std::string{space}];
+    if (Decode(bytes, state).status != DecodeStatus::kOk) return false;
     auto& destination = spaces_[std::string{space}];
     destination.insert(destination.end(), bytes.begin(), bytes.end());
+    decode_states_[std::string{space}] = std::move(state);
     return true;
   }
   bool RestoreMetrics(std::string_view space, std::uint32_t writer,
@@ -89,6 +90,7 @@ class MemoryBackend final : public IBackend {
   }
 
  private:
+  std::map<std::string, DecodeState> decode_states_;
   std::mutex mutex_;
   std::map<std::string, std::vector<std::uint8_t>> spaces_;
 };

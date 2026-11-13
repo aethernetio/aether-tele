@@ -575,7 +575,7 @@ inline void test_metadata_schema_reindex_and_static_labels_only_in_map() {
   TEST_ASSERT_TRUE(
       ExportMap(map, "test", "build-A", std::span<Tag<M> const>{tags}));
   for (auto required :
-       {"\"layout\":\"compact_blocks\"", "\"minimum_block_bytes\":6",
+       {"\"layout\":\"flat_records\"", "\"absolute_time_tag\":0",
         "\"time_values_us\":[", "\"duration_values_us\":[",
         "\"numeric_codecs\":", "caller.cpp"})
     TEST_ASSERT_TRUE(map.str().find(required) != std::string::npos);
@@ -634,47 +634,6 @@ test_unique_metadata_callsites_are_thread_safe_and_conflicts_sticky() {
   TEST_ASSERT_FALSE(
       ExportMap(ambiguous, "test", "build", std::span<Tag<M> const>{tags}));
   TEST_ASSERT_TRUE(ambiguous.str().empty());
-}
-
-inline void
-test_corrupt_controls_ranges_and_visible_lengths_are_not_repairable() {
-  std::array<std::uint8_t, 128> bytes{};
-  std::size_t cursor = 5;
-  TEST_ASSERT_TRUE(wire::Write<wire::StreamCodec>(4, bytes, cursor));
-  TEST_ASSERT_TRUE(wire::Write<wire::SequenceCodec>(0, bytes, cursor));
-  TEST_ASSERT_TRUE(wire::Write<wire::TagCodec>(7, bytes, cursor));
-  auto block = wire::FinishBlock(bytes, cursor);
-  for (std::uint8_t invalid : {2, 3, 16, 64, 5, 9, 33}) {
-    bytes[4] = invalid;
-    for (std::size_t cut = 2; cut <= block.size(); ++cut)
-      TEST_ASSERT_TRUE(Decode(block.first(cut)).status ==
-                       DecodeStatus::kMalformed);
-  }
-  // A visible payload count larger than its declared block cannot be repaired
-  // by dropping a missing physical tail.
-  cursor = 5;
-  bytes[4] = wire::Control(wire::kLogBlock, kPayload);
-  TEST_ASSERT_TRUE(wire::Write<wire::StreamCodec>(4, bytes, cursor));
-  TEST_ASSERT_TRUE(wire::Write<wire::SequenceCodec>(0, bytes, cursor));
-  TEST_ASSERT_TRUE(wire::Write<wire::TagCodec>(7, bytes, cursor));
-  TEST_ASSERT_TRUE(wire::Write<wire::BlobCodec>(100, bytes, cursor));
-  block = wire::FinishBlock(bytes, cursor + 1);
-  TEST_ASSERT_TRUE(Decode(block.first(block.size() - 1)).status ==
-                   DecodeStatus::kMalformed);
-  // Bypass logical writer limits to check hostile on-disk tag and stream IDs.
-  cursor = 5;
-  bytes[4] = 0;
-  cursor += wire::StreamCodec{65536}.Serialize(bytes.data() + cursor);
-  TEST_ASSERT_TRUE(wire::Write<wire::SequenceCodec>(0, bytes, cursor));
-  bytes[cursor++] = 0;
-  block = wire::FinishBlock(bytes, cursor);
-  TEST_ASSERT_TRUE(Decode(block).status == DecodeStatus::kMalformed);
-  cursor = 5;
-  TEST_ASSERT_TRUE(wire::Write<wire::StreamCodec>(4, bytes, cursor));
-  TEST_ASSERT_TRUE(wire::Write<wire::SequenceCodec>(0, bytes, cursor));
-  cursor += wire::TagCodec{65536}.Serialize(bytes.data() + cursor);
-  block = wire::FinishBlock(bytes, cursor);
-  TEST_ASSERT_TRUE(Decode(block).status == DecodeStatus::kMalformed);
 }
 
 inline void test_runtime_changes_concurrently_with_owner_writers() {
@@ -815,7 +774,6 @@ inline void RunTests() {
   RUN_TEST(test_macro_temporary_lifetime_and_stream_name_hygiene);
   RUN_TEST(test_metadata_schema_reindex_and_static_labels_only_in_map);
   RUN_TEST(test_unique_metadata_callsites_are_thread_safe_and_conflicts_sticky);
-  RUN_TEST(test_corrupt_controls_ranges_and_visible_lengths_are_not_repairable);
   RUN_TEST(test_runtime_changes_concurrently_with_owner_writers);
   RUN_TEST(test_record_formatter_respects_disabled_fields_and_duration_states);
 }

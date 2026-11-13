@@ -19,14 +19,13 @@ def main():
     frequency = Counter()
     records = []
     seen_paths = set()
+    times = {}
     for path in args.files:
         canonical = os.path.normcase(str(path.resolve()))
         if canonical in seen_paths:
             raise ValueError(f'capture file supplied twice: {path}')
         seen_paths.add(canonical)
-        decoded, valid_bytes, truncated = decode(path.read_bytes(), mapping)
-        if truncated:
-            print(f'{path}: interrupted tail ignored; valid_bytes={valid_bytes}', file=sys.stderr)
+        decoded, valid_bytes, truncated = decode(path.read_bytes(), mapping, times)
         records.extend(decoded)
     for record in merge_records(records):
         if record['index'] not in tags:
@@ -37,7 +36,7 @@ def main():
     result = [{'old_index': index, 'new_index': rank, 'events': frequency[index],
                'name': tags[index]['name'], 'text': tags[index]['text'],
                'file': tags[index]['file'], 'line': tags[index]['line']}
-              for rank, index in enumerate(ranked)]
+              for rank, index in enumerate(ranked, start=1)]
     print(json.dumps({'source_build': mapping['application_build'],
                       'proposed_indices': result}, ensure_ascii=False, indent=2))
 

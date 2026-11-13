@@ -1,59 +1,23 @@
 #!/usr/bin/env python3
-"""Continue compact telemetry statistics through independent process lifetimes."""
-import argparse
-import json
+"""Healthy process restarts append flat records and continue metric deltas."""
+import argparse,json,subprocess,tempfile,sys
 from pathlib import Path
-import subprocess
-import sys
-import tempfile
-
-
-sys.path.insert(0, str(Path(__file__).resolve().parents[2] / 'tools'))
-from decode_raw import _BlockReader
-
-
-def blocks(data):
-    offset = 0
-    while offset < len(data):
-        size = _BlockReader(data[offset:offset + 4], 4).packed("block_size")
-        assert size >= 6 and offset + size <= len(data)
-        yield data[offset:offset + size]
-        offset += size
-
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--exe', required=True)
-    args = parser.parse_args()
-    with tempfile.TemporaryDirectory(prefix='tele-compact-restart-') as directory:
-        root = Path(directory)
-        capture = root / 'capture.raw'
-        mapping = root / 'capture.map.json'
-        subprocess.run([args.exe, '--map', str(mapping)], check=True, timeout=15)
-        accepted = b''
-        for boot in range(5):
-            if boot:
-                # An interrupted next append may contain a valid header but only
-                # part of its rows. Repair must not change earlier blocks.
-                tail = list(blocks(accepted))[-1]
-                with capture.open('ab') as stream:
-                    stream.write(tail[:-1])
-            subprocess.run([args.exe, '--boot', str(capture), str(boot)], check=True, timeout=15)
-            contents = capture.read_bytes()
-            assert contents.startswith(accepted)
-            assert len(list(blocks(contents))) == (boot + 1) * 4
-            subprocess.run([args.exe, '--verify', str(capture), str(boot + 1)], check=True, timeout=15)
-            assert capture.read_bytes() == contents, 'restore and empty drain must not re-emit history'
-            accepted = contents
-        decoder = Path(__file__).resolve().parents[2] / 'tools' / 'decode_raw.py'
-        result = subprocess.run([sys.executable, str(decoder), '--map', str(mapping),
-                                 '--metrics', str(capture)], check=True,
-                                capture_output=True, text=True, timeout=15)
-        metrics = [json.loads(line) for line in result.stdout.splitlines() if line.strip()]
-        metric = next(row['metric'] for row in metrics if row['index'] == 7)
-        assert metric == {'count': 15, 'samples': 15, 'sum': 570, 'min': 5, 'max': 104}
-    return 0
-
-
-if __name__ == '__main__':
-    raise SystemExit(main())
+sys.path.insert(0,str(Path(__file__).resolve().parents[2]/'tools'))
+from decode_raw import decode,load_map,restore_metrics
+p=argparse.ArgumentParser();p.add_argument('--exe',required=True);a=p.parse_args()
+with tempfile.TemporaryDirectory() as tmp:
+ path=Path(tmp)/'data';mapping=Path(tmp)/'map.json'
+ subprocess.run([a.exe,'--map',str(mapping)],check=True)
+ previous=b''
+ for boot in range(5):
+  subprocess.run([a.exe,'--boot',str(path),str(boot)],check=True)
+  contents=path.read_bytes();assert contents.startswith(previous)
+  subprocess.run([a.exe,'--verify',str(path),str(boot+1)],check=True)
+  assert path.read_bytes()==contents
+  previous=contents
+ metadata=load_map(mapping);rows,used,truncated=decode(previous,metadata)
+ assert used==len(previous) and not truncated
+ assert len(rows)==10
+ assert [r['time_us'] for r in rows if r['kind']=='log']==list(range(1000,1005))
+ index=metadata['tags'][0]['index']
+ assert restore_metrics(rows)[index]==dict(count=5,samples=5,sum=25,min=5,max=5)

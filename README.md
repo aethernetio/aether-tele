@@ -10,7 +10,7 @@ and choose how it reaches a file, flash or another destination.
   tags can receive the shortest encoding. Keep each build's map with its data.
 - **One entry for a scope's lifetime.** Time uses exponential deltas; duration
   occupies one byte. Scope exit patches its original entry instead of emitting
-  another record. If that block has already drained, the duration stays
+  another record. If those bytes have already drained, the duration stays
   explicitly unknown. Profiling is flat and inclusive, with count and
   duration statistics rather than a parent/child tree.
 - **Independent spaces and runtime controls.** Modules can use separate,
@@ -23,9 +23,10 @@ and choose how it reaches a file, flash or another destination.
   retry; the application owns storage, scheduling and durability guarantees.
 - **Statistics that continue after restart.** Restore totals from acknowledged
   metric batches before recording, then accumulate new contributions without
-  sending the restored history again. A stop event is unnecessary. The decoder
-  exposes complete blocks and an interrupted tail; the native file adapter can repair
-  that tail before appending. Unacknowledged RAM changes are not durable.
+  sending the restored history again. A stop event is unnecessary. Raw records
+  continue across drains and restarts without block headers or format versions.
+  This implementation assumes normal, complete writes; interrupted-file recovery
+  is outside its scope. Unacknowledged RAM changes are not durable.
 
 The allocation-free `raw.h` core is accompanied by a sink/trap front-end for
 macro-based application logging and per-thread writer management. The existing
@@ -124,9 +125,9 @@ Profiling is **flat and inclusive**. A scope counts its entry and updates
 count/samples/sum/min/max on its owning stream. Average is `sum / samples`.
 There is no parent tree and no subtraction of nested durations. A scope emits
 one entry with a reserved duration byte. Its destructor patches that byte only
-while the original block remains mutable; it emits no completion record.
+while the original RAM bytes remain mutable; it emits no completion record.
 An instant log uses the unknown duration code when that field is enabled.
-Nested scopes and instant logs with the same field mask share a block. A scope snapshots runtime settings at entry; changes affect
+Records are appended consecutively, including when their field masks differ. A scope snapshots runtime settings at entry; changes affect
 new events/scopes; existing scopes retain their entry snapshot. Durations
 use a monotonic clock; default timestamps use wall-clock microseconds.
 
@@ -134,9 +135,9 @@ use a monotonic clock; default timestamps use wall-clock microseconds.
 
 Before a whole record would overflow RAM, the stream synchronously calls its
 drain callback on the writer thread. There are no internal locks around user
-code. Before invoking the callback the block is frozen and every outstanding duration
+code. Before invoking the callback the pending bytes are frozen and every outstanding duration
 ticket is invalidated, including on failure. Open scopes retain code 255 forever
-in that drained block; their exact RAM statistics still update on exit.
+in those drained bytes; their exact RAM statistics still update on exit.
 Success releases the bytes. Failure/exception retains the exact bytes
 for retry, and drops the new event once; `dropped()` reports lost records.
 Previously failed metric batches are retried before later log IO, preserving
@@ -163,13 +164,19 @@ barrier required by the destination (a stream flush alone is not a power-loss
 guarantee). Different writer callbacks sharing a file must serialize complete
 batches. Never interleave bytes from two callbacks.
 
-Blocks concatenate directly in a file/flash region. Each contains one or more
-records with a common field mask, writer ID and sequence base. After restart,
-`Decode` returns rows only from complete validated blocks plus `valid_bytes`;
-an interrupted final block reports `kTruncated` and contributes no rows.
-Truncate that entire block **before appending**. Malformed data reports
-`kMalformed` and must not be silently skipped. There is deliberately no checksum
-and no guarantee of detecting arbitrary bit corruption.
+Records concatenate directly in a file/flash region. Drain boundaries do not
+appear on the wire. Tag index **0** is reserved: its packed writer ID and
+absolute `uint64` microsecond timestamp reset that writer's time base. It is
+inserted before the first timed record, after a runtime configuration change,
+and when time regresses or exceeds the exponential delta range. A normal
+restart starts a new writer stream and emits this anchor; it does not need to
+load the previous log line. Counter totals are restored separately.
+
+Each normal record carries its own tag, control/field mask, writer and sequence.
+Deltas are relative to the previous **decoded** timestamp of that writer, across
+any number of drains. `DecodeState` allows successive byte chunks to be decoded
+with the same state. A complete concatenated stream can be decoded in one call.
+There is no block length, block header, magic, checksum or format version.
 
 Start, stop, pause and resume are ordinary application-defined tags, recorded
 with `kTime` enabled. There are no reserved lifecycle indices or special
@@ -186,9 +193,6 @@ be inferred from equal/disabled timestamps. The returned views borrow the input
 file bytes. Supply each persisted byte range exactly once: repeated counters
 are legitimate after restarting, so replaying the same file twice cannot be
 unambiguously distinguished from genuine data and is not deduplicated.
-Only a structurally valid interrupted tail is repairable: already
-visible invalid flags, kinds and lengths report `kMalformed`.
-
 `DrainMetrics()` first drains logs, then writes incremental flat metric batches
 even when logs are compiled/runtime-disabled. RAM `MetricFor()` totals are not
 reset, but only not-yet-acknowledged contributions are sent. A repeated drain
@@ -272,31 +276,11 @@ POSIX locks are advisory; other writers must cooperate. Do not unlink or replace
 a file while its adapter is open. The adapter checks unexpected size changes,
 but cannot detect external same-size overwrites.
 
-An append validates the whole batch before writing, completes short writes, and
-returns success only after `fsync` (POSIX) or `FlushFileBuffers` (Windows).
-On write/sync failure it truncates to the previous boundary and synchronizes
-that rollback before allowing a retry. If rollback or interrupted-tail repair
-cannot be synchronized, the adapter enters permanent `kPoisoned` state and
-refuses further appends, including after `Close()`. Reconcile the file externally
-before creating another adapter. `Append(bytes, &outcome)` captures the call's
-diagnostic under the lock; shared `status()` reports the latest operation.
-
-`Open()` scans blocks with bounded memory, preserves all complete blocks, and
-truncates only a structurally valid incomplete final block before appending.
-`recovery()` reports the original/valid sizes and removed byte count. Set
-`FileOptions::repair_incomplete_tail=false` to inspect without repair. Malformed
-data is refused without truncation. Blocks exceeding `max_record_bytes`
-(1,967,580 bytes by default) are refused, rather than treated as an interrupted write;
-use a consistent limit when reopening a capture.
-
-POSIX open also synchronizes the existing parent directory. Windows has no
-portable equivalent in this adapter: file contents/length are flushed, but
-durability of a newly created filename across power loss is outside this
-guarantee (`recovery().directory_sync_supported` is false). Storage hardware
-and filesystem guarantees still apply. A crash during append can leave complete
-blocks before the callback acknowledges the batch; reopening preserves that
-complete block prefix. Without transaction markers the raw format cannot provide
-exactly-once acknowledgement across process death.
+The native adapter serializes callback spans and appends their raw bytes.
+`Open()` reads a normal complete file and rebuilds per-writer time state;
+`RestoreMetrics()` imports acknowledged totals without writing them again.
+There is no scanning for block boundaries, tail repair or truncation recovery.
+Callbacks are synchronous; stop their writers before closing the file.
 
 This component may allocate and block during filesystem IO. It is separate from
 the allocation-free raw core and can be omitted with
@@ -330,8 +314,8 @@ and may allocate.
 Indices may change freely between application builds. Archive each build's map
 with its raw files, separately per space/build. There is no on-wire build hash
 or schema discriminator: the caller must select the matching map. A wrong map
-with overlapping indices cannot be detected automatically. Indices are limited to 0..65535 and use **1, 2 or 4 bytes**. Assign frequent
-tags indices 0..239, less frequent tags 240..4095, and the rest 4096..65535.
+with overlapping indices cannot be detected automatically. Ordinary indices are limited to 1..65535; index 0 is the absolute-time command. They use **1, 2 or 4 bytes**. Assign frequent
+tags indices 1..239, less frequent tags 240..4095, and the rest 4096..65535.
 Rank a captured workload for a future build:
 
 ```text
@@ -358,35 +342,19 @@ The wire codecs use the pinned `aethernet-numeric` revision
 aliases used by Aether's protocol are unchanged. Link `aether::tele_raw` for the
 raw headers and numeric include requirements.
 
-A block starts with its total size (`TieredInt<uint8_t,250,1500>`), control (u8), packed
-stream ID, packed first sequence, and an absolute u64 microsecond time base if
-time is present. Low control bits select logs (0) or metrics (1), field bits
-are shifted left by two, and bit 7 selects exact wide u64 numbers. Other bits
-are invalid. Writer sequence increments per row and is inferred within a block.
-There is no padding, magic, format version, checksum or session field.
+The stream has two record shapes (little endian):
 
-| Value | Numeric type | Wire bytes |
-|---|---|---|
-| Tag index | `TieredInt<uint8_t,239,4095>`; bound 65535 | 1 / 2 / 4 |
-| Stream ID | `TieredInt<uint8_t,15,1023>`; bound 65535 | 1 / 2 / 4 |
-| Sequence, exact metric sum/min/max | `TieredInt<uint16_t,32767,2000000000>` | 2 / 4 / 8 |
-| Metric count/samples | `TieredInt<uint8_t,247,2047,16000000>` | 1 / 2 / 4 / 8 |
-| Block size (including its size prefix) | `TieredInt<uint8_t,250,1500>` | 1 / 2 / 4 |
-| Blob length | `TieredInt<uint8_t,250,1500>` | 1 / 2 / 4 |
-| Time delta code | `TieredInt<uint8_t,250,511>` | 1 / 2 |
-| Scope duration code | reserved byte | 1 |
+```text
+0   | writer:StreamCodec | absolute_time_us:u64
+TAG | control:u8 | writer:StreamCodec | sequence:SequenceCodec-or-u64 | fields...
+```
 
-Blob lengths 0..250 use one byte, 251..1500 use two, and 1501..1,967,580
-use four. The maximum is about 1.88 MiB. The same ranges apply to total block
-size. A blob must also leave room for its length, tag and the block header.
-The size prefix includes itself. On growth the writer chooses the smallest
-stable width; for example, a 249-byte body makes a 250-byte block, while a
-250-byte body needs a two-byte prefix and makes a 252-byte block.
-
-Every log row starts with its tag. Enabled fields then follow in order: time
-code, duration byte, blob length and blob bytes. No size or kind is repeated per
-row. A field-mask change, capacity boundary, clock regression, or a time gap over
-60 seconds starts a new block. The new block anchors its first timestamp exactly.
+TAG is 1..65535. Low control bits select a log (0) or metric (1); field bits
+are shifted left by two; bit 7 selects exact wide u64 values. Log fields, when
+selected, are time delta, one duration byte, blob length and blob bytes. A metric
+record carries count, samples, sum, min and max instead. Each record is complete;
+there is no outer size prefix or block envelope. Blob lengths still use
+`TieredInt<uint8_t,250,1500>` (1, 2 or 4 bytes).
 
 Time uses `Exponential<FixedPoint<uint32_t,64.0>, TimeCodec, 1e-6,60.0,511>`.
 Code 0 represents zero delta. The encoder chooses the greatest reconstructed
@@ -412,32 +380,22 @@ Exact time/duration lookup tables are exported in each debug map. Python uses
 those tables, including numeric's fixed-point rounding, instead of recreating
 them with floating-point math.
 
-For frequent tags the following are row sizes in **both RAM and files**. Add one
-block header per group: at least 5 bytes without time, 13 with time; larger
-size prefixes, stream IDs and sequences can increase those to 17/25 bytes.
+For a one-byte tag/writer and a two-byte sequence, ordinary records occupy:
 
-| Enabled fields | Frequent tag row | Full tag/length range |
-|---|---:|---:|
-| tag only | 1 B | 1..4 B |
-| tag + time | 2..3 B | 2..6 B |
-| tag + duration | 2 B | 2..5 B |
-| tag + time + duration | 3..4 B | 3..7 B |
-| tag + time + duration + blob of N bytes | N+4..8 B | N+4..11 B |
+| Enabled fields | Bytes, RAM and file |
+|---|---:|
+| tag and record context | 5 |
+| plus time | 6..7 |
+| plus duration | 6 |
+| plus time and duration | 7..8 |
+| plus time, duration and N blob bytes | N+8..12 |
 
-The raw stream preallocates two arenas of `Capacity + 3` bytes (pending block and incoming
-scratch). Three extra bytes per arena keep the body and duration slots at stable
-RAM offsets when the prefix grows; these bytes are never drained. `Capacity`
-limits the complete encoded block size. The stream also has a fixed metric
-table and constant control state. Disabling fields
-increases rows per arena; it does not resize the object. Duration tickets hold
-only owner/generation/offset and never retain a buffer pointer across drain.
-
-Metric blocks contain a tag and exact count, samples, sum, min, max values.
-They start at 14 bytes per block; they never use approximate duration codes.
-Values outside a configured packed range switch the whole metric block to
-checked exact u64 fields, preserving the complete statistics API range.
-Persisted data contains no pointers. This layout replaces the earlier
-experimental fixed-width layout; start a new capture and retain its matching map.
+An absolute-time command occupies 10..13 bytes, depending on writer width.
+It is not repeated at a drain boundary. Wider tag/writer/sequence encodings add
+their own bytes. Metric values remain exact integers, with a wide u64 fallback.
+The raw stream owns a Capacity-byte pending arena, a Capacity+16 scratch arena,
+a fixed metric table and control state. Duration tickets address RAM offsets;
+draining invalidates them without generating a scope-completion record.
 
 ## Existing Aether API
 
@@ -518,7 +476,7 @@ Backend callbacks and custom formatting cannot recursively record, drain, bind
 or replace another raw front-end on that thread; those attempts are rejected
 before writer locks. `failures()` reports front-end failures.
 
-Aether's persistent `TeleStatistics` owns an archive of the accepted blocks and
+Aether's persistent `TeleStatistics` owns an archive of the accepted flat records and
 environment metadata, with runtime backend ownership outside reflection. The
 normal domain save/load path commits and restores that archive. A RAM journal
 acknowledgement alone is not a filesystem durability barrier: object graph IO

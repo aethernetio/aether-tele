@@ -142,8 +142,9 @@ bool ExportMap(std::ostream& out, std::string_view space,
   // between builds; the matching application-build map must travel with data.
   if (!ValidUtf8(space) || !ValidUtf8(build)) return false;
   for (std::size_t i = 0; i < tags.size(); ++i) {
-    if (tags[i].index > 65535 || !ValidUtf8(tags[i].name) ||
-        !ValidUtf8(tags[i].text) || !ValidUtf8(tags[i].file))
+    if (tags[i].index == 0 || tags[i].index > 65535 ||
+        !ValidUtf8(tags[i].name) || !ValidUtf8(tags[i].text) ||
+        !ValidUtf8(tags[i].file))
       return false;
     for (std::size_t j = i + 1; j < tags.size(); ++j) {
       if (tags[i].index == tags[j].index) return false;
@@ -184,13 +185,11 @@ bool ExportMap(std::ostream& out, std::string_view space,
   out << ",\n\"application_build\":";
   metadata_internal::JsonString(out, build);
   out << ",\n\"byte_order\":\"little\",\n\"time_unit\":\"microsecond\","
-         "\n\"layout\":\"compact_blocks\",\n\"minimum_block_bytes\":6,"
-         "\n\"header\":["
-         "{\"name\":\"size\",\"type\":\"block_size\"},"
-         "{\"name\":\"control\",\"type\":\"u8\"},"
-         "{\"name\":\"stream\",\"type\":\"stream\"},"
-         "{\"name\":\"first_sequence\",\"type\":\"sequence_or_wide_u64\"},"
-         "{\"name\":\"base_time_us\",\"type\":\"u64\",\"when\":\"log_time\"}],"
+         "\n\"layout\":\"flat_records\","
+         "\n\"absolute_time_tag\":0,"
+         "\n\"absolute_time_record\":[\"tag=0\",\"stream\",\"u64_time_us\"],"
+         "\n\"record\":[\"tag\",\"control\",\"stream\",\"sequence\",\"selected_"
+         "fields\"],"
          "\n\"control\":{\"kind_mask\":3,\"fields_mask\":44,"
          "\"fields_shift\":2,\"wide_mask\":128,\"reserved_mask\":80},"
          "\n\"fields\":["
@@ -199,7 +198,6 @@ bool ExportMap(std::ostream& out, std::string_view space,
          "{\"bit\":8,\"name\":\"payload\",\"type\":\"blob_length_bytes\"}],"
          "\n\"kinds\":{\"0\":\"log\",\"1\":\"metric\"},"
          "\n\"numeric_codecs\":{"
-         "\"block_size\":{\"base_bytes\":1,\"thresholds\":[250,1500]},"
          "\"tag\":{\"base_bytes\":1,\"thresholds\":[239,4095],\"max_value\":"
          "65535},"
          "\"stream\":{\"base_bytes\":1,\"thresholds\":[15,1023],\"max_value\":"
@@ -237,28 +235,15 @@ bool ExportMap(std::ostream& out, std::string_view space,
          "\"wide\":\"all five metric values are u64 when wide_mask is set\","
          "\"aggregation\":\"acknowledged disjoint batches; sum each persisted "
          "batch exactly once\"},"
-         "\n\"instructions\":\"Blocks concatenate without padding. Size "
-         "includes "
-         "the complete block including the packed size prefix; rows have no "
-         "size or kind prefix. Stream, first "
-         "sequence and optional time base occur once in the ordered header. "
-         "Every row begins with its tag; sequence is first_sequence plus row "
-         "ordinal. Fields occur in ascending bit order only when enabled. "
-         "Packed integers use ae-numeric TieredInt with the listed base cell "
-         "and tier thresholds; cells are little endian. Wide control switches "
-         "sequence and all five metric values to exact u64. Timestamp starts "
-         "at base_time_us, then adds time_values_us[time_code] for each row. "
-         "Use the exported lookup tables exactly; they include fixed-point "
-         "rounding. Duration codes 1..253 are numeric; codes 0,254,255 mean "
-         "below minimum, above maximum, unknown respectively. Drained scope "
-         "duration slots stay unknown. Metrics retain exact microseconds. "
-         "An interrupted block contributes no rows; keep only complete blocks "
-         "when repairing a tail. No magic, checksum, version or session field. "
-         "Level, module, text and source are restored from the unique tag map. "
-         "Start, stop, pause and resume are ordinary timestamped events. "
-         "Preserve writer append order across sequence resets. Supply "
-         "non-overlapping captures in append order and the matching build map; "
-         "wrong-build input cannot be identified automatically.\","
+         "\n\"instructions\":\"Flat records concatenate without block headers, "
+         "sizes or versions. "
+         "Tag zero is stream ID followed by absolute u64 microseconds. "
+         "Nonzero tags are control, stream, sequence, selected fields. "
+         "Time deltas use the previous decoded time of that writer, across "
+         "drains. "
+         "Wide control uses u64 sequence and metric values. "
+         "Use the exported numeric lookup tables. Duration "
+         "0=below,254=above,255=unknown.\","
          "\n\"tags\":[";
   bool first = true;
   for (auto const& tag : tags) {
