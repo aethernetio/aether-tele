@@ -1,9 +1,37 @@
 # aether-tele
 
-C++20 telemetry. The existing `TeleSink` / `ITrap` API and the serialization
-of `StatisticsTrap` remain available. The new `aether-tele/raw.h` layer records
-plain data; it does not change Aether's persistent `TeleStatistics` object or
-the cloud protocol.
+C++20 binary logging and flat profiling for applications with a limited RAM
+and storage budget. Record compact data, decode it with the matching build map,
+and choose how it reaches a file, flash or another destination.
+
+- **Small indices, separate context.** Records identify a logging callsite by
+  its numeric tag. The build map supplies descriptions, source locations and
+  the binary layout. Indices can change between builds, so frequently used
+  tags can receive the shortest encoding. Keep each build's map with its data.
+- **One entry for a scope's lifetime.** Time uses exponential deltas; duration
+  occupies one byte. Scope exit patches its original entry instead of emitting
+  another record. If that block has already drained, the duration stays
+  explicitly unknown. Profiling is flat and inclusive, with count and
+  duration statistics rather than a parent/child tree.
+- **Independent spaces and runtime controls.** Modules can use separate,
+  type-safe namespaces with their own tag indices, collection masks and writer
+  streams. Logs, fields, counters and timings can change at runtime within
+  the features enabled at compile time.
+- **Application-owned drain.** The raw core records into fixed RAM arenas
+  without allocating. As an arena fills, it calls your synchronous drain
+  callback. A rejected batch remains available unchanged for
+  retry; the application owns storage, scheduling and durability guarantees.
+- **Statistics that continue after restart.** Restore totals from acknowledged
+  metric batches before recording, then accumulate new contributions without
+  sending the restored history again. A stop event is unnecessary. The decoder
+  exposes complete blocks and an interrupted tail; the native file adapter can repair
+  that tail before appending. Unacknowledged RAM changes are not durable.
+
+The allocation-free `raw.h` core is accompanied by a sink/trap front-end for
+macro-based application logging and per-thread writer management. The existing
+`TeleSink` / `ITrap` API and `StatisticsTrap` serialization remain available.
+
+## Toolchain support
 
 The public headers require C++20. Both exception-enabled and exception-disabled
 consumers are supported, and the CMake targets preserve the consumer's policy.
@@ -13,6 +41,12 @@ through their return values; allocation failures follow the toolchain's fatal
 failure policy. The raw library does not require RTTI. Backends can optionally
 expose a process-local `TypeToken()` for checked concrete-type access without
 RTTI; the default token is null.
+
+The allocation-free recording and lazy-payload guarantees below apply to the
+low-level raw core. The sink/trap front-end maintains runtime state: its macros
+currently access the sink singleton and evaluate arguments even when event
+collection is disabled. Disabling console output also does not promise removal
+of all console-related code from the binary.
 
 ## Raw telemetry
 
