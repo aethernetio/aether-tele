@@ -57,11 +57,15 @@ target_include_directories(test-raw-reindexed PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-raw-reindexed PRIVATE aether::tele_raw unity Threads::Threads)
 target_compile_definitions(test-raw-reindexed PRIVATE AE_TELE_RAW_DEBUG=1 AE_TELE_TEST_NATIVE_FILE=0 RAW_TEST_TAG_INDEX=2000)
 add_test(NAME test-raw-reindexed COMMAND test-raw-reindexed)
-foreach(raw_target test-raw-tele test-raw-reindexed)
-  add_custom_command(TARGET ${raw_target} POST_BUILD
-    COMMAND $<TARGET_FILE:${raw_target}> --map $<TARGET_FILE_DIR:${raw_target}>/${raw_target}.map.json
-    COMMENT "Exporting raw telemetry debug map")
-endforeach()
+# Cross-built binaries must be run on their target, never by the build host.
+# Using the target name lets CMake prepend an explicitly configured emulator.
+if(NOT CMAKE_CROSSCOMPILING OR CMAKE_CROSSCOMPILING_EMULATOR)
+  foreach(raw_target test-raw-tele test-raw-reindexed)
+    add_custom_command(TARGET ${raw_target} POST_BUILD
+      COMMAND ${raw_target} --map $<TARGET_FILE_DIR:${raw_target}>/${raw_target}.map.json
+      COMMENT "Exporting raw telemetry debug map")
+  endforeach()
+endif()
 add_executable(test-tele-routing raw/legacy_routing.cpp raw/legacy_order_ab.cpp raw/legacy_order_ba.cpp)
 target_link_libraries(test-tele-routing PRIVATE aether::tele unity)
 add_test(NAME test-tele-routing COMMAND test-tele-routing)
