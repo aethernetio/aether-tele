@@ -41,7 +41,7 @@ include(cmake/CPM.cmake)
 CPMAddPackage(
   NAME ae-numeric
   GITHUB_REPOSITORY aethernetio/aethernet-numeric
-  GIT_TAG 9d79bd79188420533bab07c437d617aedfaf6b1a
+  GIT_TAG d5969e7a50f1fbbf0a195bb8b256ad0c9c15115c
   OPTIONS
     "AE_NUMERIC_INSTALL ${AE_TELE_INSTALL}"
     "AE_BUILD_TESTS OFF"
