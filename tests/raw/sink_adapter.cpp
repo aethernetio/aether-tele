@@ -312,21 +312,26 @@ void test_backend_migration_is_atomic_with_concurrent_open_scopes() {
 void test_canonical_query_saturates_without_adding_restored_totals_twice() {
   auto backend = std::make_shared<Backend>();
   auto& sink = Sink<12>::Instance();
-  auto maximum = std::numeric_limits<std::uint64_t>::max();
+  auto maximum = ae::tele::raw::kMetricMax;
   std::array<std::uint8_t, 128> bytes{};
-  std::size_t cursor = 0;
+  std::size_t cursor = ae::tele::raw::wire::kMaxBlockHeaderBytes;
   TEST_ASSERT_TRUE(ae::tele::raw::wire::Write<ae::tele::raw::wire::TagCodec>(
       1, bytes, cursor));
-  bytes[cursor++] =
-      ae::tele::raw::wire::Control(ae::tele::raw::wire::kMetricRecord, 0, true);
-  TEST_ASSERT_TRUE(ae::tele::raw::wire::Write<ae::tele::raw::wire::StreamCodec>(
-      0, bytes, cursor));
-  TEST_ASSERT_TRUE(ae::tele::raw::wire::WriteU64(0, bytes, cursor));
   for (auto value :
        {maximum, maximum, maximum, std::uint64_t{1}, std::uint64_t{2}})
-    TEST_ASSERT_TRUE(ae::tele::raw::wire::WriteU64(value, bytes, cursor));
+    TEST_ASSERT_TRUE(
+        ae::tele::raw::wire::Write<ae::tele::raw::wire::MetricCodec>(
+            value, bytes, cursor));
+  std::array<std::uint8_t, ae::tele::raw::wire::kMaxBlockHeaderBytes> header{};
+  std::size_t header_size = 0;
+  TEST_ASSERT_TRUE(ae::tele::raw::wire::WriteBlockHeader(
+      header, header_size, ae::tele::raw::wire::kMetricRecord, 0, 0,
+      cursor - ae::tele::raw::wire::kMaxBlockHeaderBytes, 1));
+  auto begin = ae::tele::raw::wire::kMaxBlockHeaderBytes - header_size;
+  std::copy_n(header.begin(), header_size, bytes.begin() + begin);
   TEST_ASSERT_TRUE(backend->Append(
-      "adapter", std::span<std::uint8_t const>{bytes}.first(cursor)));
+      "adapter",
+      std::span<std::uint8_t const>{bytes}.subspan(begin, cursor - begin)));
   TEST_ASSERT_TRUE(sink.SetBackend(backend));
   TEST_ASSERT_TRUE(sink.BindWriter(0));
   Emit<Sink<12>>();

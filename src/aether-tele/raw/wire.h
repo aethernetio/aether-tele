@@ -38,9 +38,9 @@ namespace ae::tele::raw::wire {
 
 using TagCodec = ae::TieredInt<std::uint8_t, 239, 4095>;
 using StreamCodec = ae::TieredInt<std::uint8_t, 15, 1023>;
-using SequenceCodec = ae::TieredInt<std::uint16_t, 32767, 2'000'000'000>;
-using CountCodec = ae::TieredInt<std::uint8_t, 247, 2047, 16'000'000>;
-using SumCodec = SequenceCodec;
+using MetricCodec = ae::TieredInt<std::uint8_t, 200, 5'000, 100'000'000>;
+using CountCodec = MetricCodec;
+using SumCodec = MetricCodec;
 // Approved blob-length tiers: 0..250 -> 1 byte, 251..1500 -> 2 bytes,
 // 1501..1'967'580 -> 4 bytes. The final maximum is derived by numeric.
 using BlobCodec = ae::TieredInt<std::uint8_t, 250, 1500>;
@@ -53,7 +53,6 @@ using TimeExp = ae::Exponential<RuntimeSeconds, TimeCodec, 0.000001, 60.0, 511>;
 
 inline constexpr std::uint8_t kLogRecord = 0;
 inline constexpr std::uint8_t kMetricRecord = 1;
-inline constexpr std::uint8_t kWide = 0x80;
 inline constexpr std::uint32_t kMaxTag = 65535;
 inline constexpr std::uint32_t kMaxStream = 65535;
 inline constexpr std::uint64_t kDurationMinUs = 1;
@@ -68,20 +67,11 @@ inline constexpr std::uint16_t kTimeOverflow = 512;
 
 enum class ReadStatus { kOk, kTruncated, kMalformed };
 
-constexpr std::uint8_t Control(std::uint8_t kind, std::uint32_t fields,
-                               bool wide = false) noexcept {
-  return static_cast<std::uint8_t>(kind | (fields << 2) | (wide ? kWide : 0));
-}
-constexpr std::uint32_t Fields(std::uint8_t control) noexcept {
-  return (control >> 2) & kAllFields;
-}
-constexpr bool ValidControl(std::uint8_t control) noexcept {
-  constexpr auto allowed =
-      static_cast<std::uint8_t>(3 | (kAllFields << 2) | kWide);
-  auto const kind = control & 3;
-  return (control & ~allowed) == 0 && kind <= kMetricRecord &&
-         (kind != kMetricRecord || Fields(control) == 0);
-}
+// A complete callback batch is a telemetry block. Kind and layout belong to
+// the block; each writer header carries its ID, body length and record count.
+// Individual records contain only a tag and their data, never control/sequence.
+inline constexpr std::size_t kMaxBlockHeaderBytes = 32;
+static_assert(MetricCodec::kUpper == kMetricMax);
 
 template <typename Codec>
 constexpr std::uint64_t Limit() noexcept {
@@ -218,6 +208,40 @@ inline DurationValue DecodeDuration(std::uint8_t code) noexcept {
   if (code == kDurationAboveMax) return {DurationState::kAboveMax, 0};
   if (code == kDurationUnknown) return {DurationState::kUnknown, 0};
   return {DurationState::kValue, DurationValues()[code]};
+}
+
+inline bool WriteBlockPrefix(std::span<std::uint8_t> out, std::size_t& cursor,
+                             std::uint8_t kind, std::uint32_t fields,
+                             std::uint32_t writers) {
+  if (cursor >= out.size() || kind > kMetricRecord || (fields & ~kAllFields) ||
+      (kind == kMetricRecord && fields) || !writers || writers > kMaxStream)
+    return false;
+  out[cursor++] = kind;
+  if (!Write<StreamCodec>(writers, out, cursor)) return false;
+  if (kind == kLogRecord) {
+    if (cursor == out.size()) return false;
+    out[cursor++] = static_cast<std::uint8_t>(fields);
+  }
+  return true;
+}
+inline bool WriteWriterHeader(std::span<std::uint8_t> out, std::size_t& cursor,
+                              std::uint32_t fields, std::uint32_t writer,
+                              std::size_t body_bytes, std::uint64_t records,
+                              std::uint64_t base_time = 0) {
+  return body_bytes && records && !(fields & ~kAllFields) &&
+         Write<StreamCodec>(writer, out, cursor) &&
+         Write<BlobCodec>(body_bytes, out, cursor) &&
+         Write<MetricCodec>(records, out, cursor) &&
+         (!(fields & kTime) || WriteU64(base_time, out, cursor));
+}
+inline bool WriteBlockHeader(std::span<std::uint8_t> out, std::size_t& cursor,
+                             std::uint8_t kind, std::uint32_t fields,
+                             std::uint32_t writer, std::size_t body_bytes,
+                             std::uint64_t records,
+                             std::uint64_t base_time = 0) {
+  return WriteBlockPrefix(out, cursor, kind, fields, 1) &&
+         WriteWriterHeader(out, cursor, fields, writer, body_bytes, records,
+                           base_time);
 }
 
 static_assert(TagCodec::kMaxWireBytes == 4);

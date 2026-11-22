@@ -4,7 +4,7 @@
 
 This tool has no magic/checksum/build autodetection. Keep data from different
 spaces/builds separate, and select the correct map explicitly.
-Input is a continuous flat stream; no interrupted-write recovery is performed.
+Input is concatenated telemetry blocks; no interrupted-write recovery is performed.
 """
 
 from __future__ import annotations
@@ -21,9 +21,7 @@ MAX_U64 = (1 << 64) - 1
 CODECS = {
     "tag": (1, (239, 4095), 65535),
     "stream": (1, (15, 1023), 65535),
-    "sequence": (2, (32767, 2_000_000_000), None),
-    "count": (1, (247, 2047, 16_000_000), None),
-    "sum": (2, (32767, 2_000_000_000), None),
+    "metric": (1, (200, 5000, 100_000_000), 2_182_612_529_211_367_680),
     "blob": (1, (250, 1500), None),
     "time": (1, (250, 511), 511),
 }
@@ -105,67 +103,117 @@ def _table(metadata: dict | None, name: str, length: int) -> list[int]:
     return values
 
 
-def decode(data: bytes, metadata: dict | None = None, times: dict | None = None) -> tuple[list[dict], int, bool]:
-    """Decode a normal flat stream. Supply the same times for successive chunks."""
+def decode(data: bytes, metadata: dict | None = None, times: dict | None = None,
+           *, include_wire: bool = False, wire_stats: dict | None = None) -> tuple[list[dict], int, bool]:
+    """Decode complete blocks; each writer's time base is stored in its header.
+
+    Record wire sizes exclude headers and absolute-time reset commands. State
+    and wire statistics are committed only after the entire input validates.
+    """
     reader = _RecordReader(data, len(data))
-    times = {} if times is None else times
+    working_times = {} if times is None else times.copy()
     records = []
+    stats = dict(block_count=0, writer_block_count=0, log_block_header_bytes=0,
+                 metric_block_header_bytes=0, time_anchor_bytes=0)
     time_values = duration_values = None
     while reader.cursor < len(data):
-        index = reader.packed("tag")
-        if index == 0:
+        block_start = reader.cursor
+        kind = reader.number(1)
+        if kind > 1:
+            raise DecodeError("invalid block kind (old flat captures require their old decoder)")
+        writers = reader.packed("stream")
+        if not writers or writers > len(data) - reader.cursor:
+            raise DecodeError("invalid writer count")
+        flags = reader.number(1) if kind == 0 else 0
+        if flags & ~11:
+            raise DecodeError("invalid block field layout")
+        header_key = "log_block_header_bytes" if kind == 0 else "metric_block_header_bytes"
+        stats[header_key] += reader.cursor - block_start
+        stats["block_count"] += 1
+        seen = set()
+        for _ in range(writers):
+            writer_start = reader.cursor
             stream = reader.packed("stream")
-            times[stream] = reader.number(8)
-            continue
-        control = reader.number(1)
-        kind, flags, wide = control & 3, (control & 0x2c) >> 2, bool(control & 128)
-        if control & ~0xaf or kind > 1 or (kind == 1 and flags):
-            raise DecodeError("invalid record control")
-        stream = reader.packed("stream")
-        sequence = reader.number(8) if wide else reader.packed("sequence")
-        if flags & 1 and stream not in times:
-            raise DecodeError("time anchor missing for writer")
-        record = {"index": index, "stream": stream, "fields": flags,
-                  "sequence": sequence, "kind": "log" if kind == 0 else "metric"}
-        if kind == 1:
-            names = ("count", "samples", "sum", "min", "max")
-            values = [reader.number(8) if wide else reader.packed(codec)
-                      for codec in ("count", "count", "sum", "sum", "sum")]
-            metric = dict(zip(names, values))
-            if metric["samples"] and metric["min"] > metric["max"]:
-                raise DecodeError("invalid metric min/max")
-            record["metric"] = metric
-        else:
-            if flags & 1:
-                code = reader.packed("time")
-                if time_values is None:
-                    time_values = _table(metadata, "time_values_us", 512)
-                timestamp = times[stream] + time_values[code]
-                times[stream] = timestamp
-                if timestamp > MAX_U64:
-                    raise DecodeError("timestamp delta overflows u64")
-                record["time_us"] = timestamp
-            if flags & 2:
-                code = reader.number(1)
-                record["duration_code"] = code
-                if code in (0, 254, 255):
-                    record["duration_state"] = {0: "below_min", 254: "above_max",
-                                                255: "unknown"}[code]
+            size, count = reader.packed("blob"), reader.packed("metric")
+            if stream in seen or not size or not count or count > size:
+                raise DecodeError("invalid or duplicate writer body")
+            seen.add(stream)
+            timestamp = reader.number(8) if flags & 1 else 0
+            stats[header_key] += reader.cursor - writer_start
+            stats["writer_block_count"] += 1
+            end = reader.cursor + size
+            if end > len(data):
+                raise DecodeError("writer body is incomplete")
+            body = _RecordReader(data, end, reader.cursor)
+            decoded_count = 0
+            while decoded_count < count:
+                start = body.cursor
+                payload_bytes = payload_length_bytes = 0
+                index = body.packed("tag")
+                if index == 0:
+                    if not flags & 1:
+                        raise DecodeError("absolute time command in an untimed block")
+                    timestamp = body.number(8)
+                    stats["time_anchor_bytes"] += body.cursor - start
+                    continue
+                record = {"index": index, "stream": stream, "fields": flags,
+                          "kind": "log" if kind == 0 else "metric"}
+                if kind == 1:
+                    metric = dict(zip(("count", "samples", "sum", "min", "max"),
+                                      (body.packed("metric") for _ in range(5))))
+                    if metric["samples"] and metric["min"] > metric["max"]:
+                        raise DecodeError("invalid metric min/max")
+                    record["metric"] = metric
                 else:
-                    record["duration_state"] = "value"
-                    if code in (1, 253):
-                        record["duration_us"] = 1 if code == 1 else 60_000_000
-                    else:
-                        if duration_values is None:
-                            duration_values = _table(metadata, "duration_values_us", 254)
-                        record["duration_us"] = duration_values[code]
-            if flags & 8:
-                record["payload_hex"] = reader.take(reader.packed("blob")).hex()
-        records.append(record)
+                    if flags & 1:
+                        code = body.packed("time")
+                        if time_values is None:
+                            time_values = _table(metadata, "time_values_us", 512)
+                        timestamp += time_values[code]
+                        if timestamp > MAX_U64:
+                            raise DecodeError("timestamp delta overflows u64")
+                        record["time_us"] = timestamp
+                    if flags & 2:
+                        code = body.number(1)
+                        record["duration_code"] = code
+                        if code in (0, 254, 255):
+                            record["duration_state"] = {0: "below_min", 254: "above_max",
+                                                        255: "unknown"}[code]
+                        else:
+                            record["duration_state"] = "value"
+                            if code in (1, 253):
+                                record["duration_us"] = 1 if code == 1 else 60_000_000
+                            else:
+                                if duration_values is None:
+                                    duration_values = _table(metadata, "duration_values_us", 254)
+                                record["duration_us"] = duration_values[code]
+                    if flags & 8:
+                        length_start = body.cursor
+                        payload_bytes = body.packed("blob")
+                        payload_length_bytes = body.cursor - length_start
+                        record["payload_hex"] = body.take(payload_bytes).hex()
+                if include_wire:
+                    record["wire"] = {"offset": start, "bytes": body.cursor - start,
+                                      "payload_bytes": payload_bytes,
+                                      "payload_length_bytes": payload_length_bytes}
+                records.append(record)
+                decoded_count += 1
+            if body.cursor != end:
+                raise DecodeError("writer length/record count mismatch")
+            reader.cursor = end
+            if flags & 1:
+                working_times[stream] = timestamp
+    if times is not None:
+        times.clear()
+        times.update(working_times)
+    if wire_stats is not None:
+        for key, value in stats.items():
+            wire_stats[key] = wire_stats.get(key, 0) + value
     return records, len(data), False
 
+
 def merge_records(records: list[dict]) -> list[dict]:
-    """Merge writer heads, preserving append order across sequence resets.
+    """Merge writer heads, preserving physical append order across process restarts.
 
     Supply captures chronologically, without overlapping persisted bytes. Start,
     stop, pause and resume are ordinary timestamped events, not framing markers.
@@ -203,9 +251,9 @@ def merge_records(records: list[dict]) -> list[dict]:
 def load_map(path: Path) -> dict:
     metadata = json.loads(path.read_text(encoding="utf-8"))
     if (metadata.get("byte_order") != "little" or
-            metadata.get("layout") != "flat_records" or
+            metadata.get("layout") != "thread_blocks" or
             metadata.get("absolute_time_tag") != 0):
-        raise DecodeError("map does not describe the current compact raw tele layout")
+        raise DecodeError("map does not describe the thread-block telemetry layout")
     if metadata.get("fields") != FIELDS:
         raise DecodeError("map does not describe the current raw event fields")
     expected_codecs = {
@@ -242,7 +290,7 @@ def load_map(path: Path) -> dict:
 def restore_metrics(records: list[dict]) -> dict[int, dict]:
     """Sum acknowledged disjoint metric batches; never infer restart groups."""
     result: dict[int, dict] = {}
-    maximum = (1 << 64) - 1
+    maximum = CODECS["metric"][2]
     for record in records:
         if "metric" not in record:
             continue

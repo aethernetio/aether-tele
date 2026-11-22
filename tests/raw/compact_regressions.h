@@ -162,7 +162,7 @@ inline void test_seed_and_new_deltas_saturate_independently() {
   S space;
   Destination destination;
   Stream<S, 28> stream(space, 4, Save, &destination);
-  auto const maximum = std::numeric_limits<std::uint64_t>::max();
+  auto const maximum = kMetricMax;
   std::array seed{MetricTotal{7, Metric{maximum, maximum, maximum - 1, 2, 10}}};
   TEST_ASSERT_TRUE(stream.RestoreMetrics(seed));
   stream.Count(7);
@@ -575,7 +575,7 @@ inline void test_metadata_schema_reindex_and_static_labels_only_in_map() {
   TEST_ASSERT_TRUE(
       ExportMap(map, "test", "build-A", std::span<Tag<M> const>{tags}));
   for (auto required :
-       {"\"layout\":\"flat_records\"", "\"absolute_time_tag\":0",
+       {"\"layout\":\"thread_blocks\"", "\"absolute_time_tag\":0",
         "\"time_values_us\":[", "\"duration_values_us\":[",
         "\"numeric_codecs\":", "caller.cpp"})
     TEST_ASSERT_TRUE(map.str().find(required) != std::string::npos);

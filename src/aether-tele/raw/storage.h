@@ -34,7 +34,7 @@ class Stream {
   static constexpr std::size_t kCapacity = Capacity;
   static constexpr std::size_t kMetricCapacity = MetricCapacity;
   static_assert(Capacity >= kHeaderSize);
-  static_assert(Capacity <= std::numeric_limits<std::uint32_t>::max());
+  static_assert(Capacity <= wire::BlobCodec::kUpper);
   struct DurationTicket {
     std::uint64_t generation{};
     std::size_t offset{};
@@ -64,6 +64,11 @@ class Stream {
       return false;
     for (std::size_t i = 0; i < totals.size(); ++i) {
       if (totals[i].index == 0 || totals[i].index > wire::kMaxTag ||
+          totals[i].metric.count > kMetricMax ||
+          totals[i].metric.samples > kMetricMax ||
+          totals[i].metric.sum > kMetricMax ||
+          totals[i].metric.min > kMetricMax ||
+          totals[i].metric.max > kMetricMax ||
           (totals[i].metric.samples &&
            totals[i].metric.min > totals[i].metric.max))
         return false;
@@ -87,29 +92,26 @@ class Stream {
     bool const to_console = snapshot.console && console_;
     if (!snapshot.logs && !to_console) return true;
     restore_closed_ = true;
-    if (busy_ || sequence_exhausted_ || stream_id_ > wire::kMaxStream ||
-        tag.index == 0 || tag.index > wire::kMaxTag || kind != Kind::kLog) {
+    if (busy_ || stream_id_ > wire::kMaxStream || tag.index == 0 ||
+        tag.index > wire::kMaxTag || kind != Kind::kLog) {
       Increment(dropped_);
       return false;
     }
     BusyGuard guard{busy_};
     auto const fields = snapshot.fields;
-    auto const sequence = sequence_;
-    // Each record is independent of RAM batching. Only time bases carry tag 0.
+    // Time anchors inside a writer body do not repeat the writer ID.
     auto const epoch = space_.RuntimeEpoch();
-    bool const anchor =
-        (fields & kTime) &&
-        (!time_valid_ || epoch != time_epoch_ || timestamp < last_time_ ||
-         timestamp - last_time_ > wire::kMaxTimeDeltaUs);
+    bool const anchor = (fields & kTime) && time_valid_ &&
+                        (epoch != time_epoch_ || timestamp < last_time_ ||
+                         timestamp - last_time_ > wire::kMaxTimeDeltaUs);
     auto const previous_time = last_time_;
+    auto const base_time = time_valid_ ? previous_time : timestamp;
     std::uint16_t delta = 0;
-    if ((fields & kTime) && !anchor)
+    if ((fields & kTime) && time_valid_ && !anchor)
       delta = wire::EncodeTime(timestamp - last_time_);
     std::size_t cursor = 0;
     if (anchor && !TimeAnchor(scratch_, cursor, timestamp)) return Drop();
-    bool const wide = sequence > wire::SequenceCodec::kUpper;
-    if (!wire::Write<wire::TagCodec>(tag.index, scratch_, cursor) ||
-        !Header(scratch_, cursor, wire::kLogRecord, fields, wide, sequence, 0))
+    if (!wire::Write<wire::TagCodec>(tag.index, scratch_, cursor))
       return Drop();
     if ((fields & kTime) &&
         !wire::Write<wire::TimeCodec>(delta, scratch_, cursor))
@@ -133,36 +135,43 @@ class Stream {
     if (cursor > Capacity) return Drop();
     bool success = true;
     if (snapshot.logs) {
-      if ((frozen_ || cursor > Capacity - used_) && !DrainPending()) {
+      if ((frozen_ || (used_ && fields != pending_fields_) ||
+           cursor > Capacity - used_) &&
+          !DrainPending()) {
         success = false;
         Increment(dropped_);
       } else {
-        auto const offset = used_;
-        std::memcpy(bytes_.data() + used_, scratch_.data(), cursor);
+        if (!used_) {
+          pending_fields_ = fields;
+          base_time_ = base_time;
+        }
+        auto const offset = wire::kMaxBlockHeaderBytes + used_;
+        std::memcpy(bytes_.data() + offset, scratch_.data(), cursor);
         used_ += cursor;
+        ++records_;
         if (ticket && (fields & kDuration) && !slots_disabled_)
           *ticket = {generation_, offset + duration_at, true, this};
         if (fields & kTime) {
-          last_time_ = anchor ? timestamp : last_time_ + wire::TimeValue(delta);
+          last_time_ = anchor ? timestamp : base_time + wire::TimeValue(delta);
           time_valid_ = true;
           time_epoch_ = epoch;
         }
       }
     }
-    // Console callbacks receive a standalone time anchor, without changing
-    // the persisted writer's time base or introducing drain boundaries.
+    // Console callbacks receive their own complete one-record block.
     auto console_size = cursor;
-    if (to_console && (fields & kTime) && !anchor) {
-      std::array<std::uint8_t, 16> prefix{};
+    if (to_console) {
+      std::array<std::uint8_t, wire::kMaxBlockHeaderBytes> prefix{};
       std::size_t prefix_size = 0;
-      if (!TimeAnchor(prefix, prefix_size, previous_time)) return Drop();
+      if (!wire::WriteBlockHeader(prefix, prefix_size, wire::kLogRecord, fields,
+                                  stream_id_, cursor, 1, base_time))
+        return Drop();
       std::memmove(scratch_.data() + prefix_size, scratch_.data(), cursor);
       std::memcpy(scratch_.data(), prefix.data(), prefix_size);
       console_size += prefix_size;
     }
     auto const console_bytes =
         std::span<std::uint8_t const>{scratch_}.first(console_size);
-    if (success || to_console) AdvanceSequence();
     if (to_console) {
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
       try {
@@ -182,7 +191,8 @@ class Stream {
                       std::uint64_t microseconds) noexcept {
     if (busy_ || frozen_ || slots_disabled_ || !ticket.valid ||
         ticket.owner != this || ticket.generation != generation_ ||
-        ticket.offset >= used_ ||
+        ticket.offset < wire::kMaxBlockHeaderBytes ||
+        ticket.offset >= wire::kMaxBlockHeaderBytes + used_ ||
         bytes_[ticket.offset] != wire::kDurationUnknown)
       return false;
     bytes_[ticket.offset] = wire::EncodeDuration(microseconds);
@@ -201,19 +211,25 @@ class Stream {
     if (!DrainPending()) return false;
     for (auto& entry : metrics_) {
       if (!entry.occupied || !HasDelta(entry.delta)) continue;
-      if (!drain_ || sequence_exhausted_) return false;
+      if (!drain_) return false;
       entry.retry = entry.delta;
       entry.delta = {};
-      entry.retry_sequence = sequence_;
       entry.retry_pending = true;
-      AdvanceSequence();
       if (!DrainMetricRetry(entry)) return false;
     }
     return true;
   }
   std::span<std::uint8_t const> pending() const noexcept {
-    return used_ ? std::span<std::uint8_t const>{bytes_.data(), used_}
-                 : std::span<std::uint8_t const>{};
+    if (!used_) return {};
+    std::array<std::uint8_t, wire::kMaxBlockHeaderBytes> header{};
+    std::size_t length = 0;
+    if (!wire::WriteBlockHeader(header, length, wire::kLogRecord,
+                                pending_fields_, stream_id_, used_, records_,
+                                base_time_))
+      return {};
+    auto const offset = wire::kMaxBlockHeaderBytes - length;
+    std::memcpy(bytes_.data() + offset, header.data(), length);
+    return {bytes_.data() + offset, length + used_};
   }
   std::uint64_t dropped() const noexcept { return dropped_; }
   std::uint64_t metric_overflow() const noexcept { return metric_overflow_; }
@@ -221,8 +237,8 @@ class Stream {
   void Count(std::uint32_t index) noexcept {
     restore_closed_ = true;
     if (auto* e = FindOrInsert(index)) {
-      Increment(e->metric.count);
-      Increment(e->delta.count);
+      if (e->metric.count < kMetricMax) ++e->metric.count;
+      if (e->delta.count < kMetricMax) ++e->delta.count;
     }
   }
   void AddDuration(std::uint32_t index, std::uint64_t duration) noexcept {
@@ -263,7 +279,6 @@ class Stream {
     std::uint32_t index{};
     bool occupied{};
     Metric metric{}, delta{}, retry{};
-    std::uint64_t retry_sequence{};
     bool retry_pending{};
   };
   static bool HasDelta(Metric const& m) noexcept {
@@ -273,20 +288,15 @@ class Stream {
     if (n != UINT64_MAX) ++n;
   }
   static void UpdateDuration(Metric& m, std::uint64_t d) noexcept {
+    d = std::min(d, kMetricMax);
     if (!m.samples)
       m.min = m.max = d;
     else {
       m.min = std::min(m.min, d);
       m.max = std::max(m.max, d);
     }
-    Increment(m.samples);
-    m.sum = d > UINT64_MAX - m.sum ? UINT64_MAX : m.sum + d;
-  }
-  void AdvanceSequence() noexcept {
-    if (sequence_ == UINT64_MAX)
-      sequence_exhausted_ = true;
-    else
-      ++sequence_;
+    if (m.samples < kMetricMax) ++m.samples;
+    m.sum = d > kMetricMax - m.sum ? kMetricMax : m.sum + d;
   }
   bool Drop() noexcept {
     Increment(dropped_);
@@ -310,51 +320,37 @@ class Stream {
     Increment(metric_overflow_);
     return nullptr;
   }
-  bool Header(std::span<std::uint8_t> out, std::size_t& cursor,
-              std::uint8_t kind, std::uint32_t fields, bool wide,
-              std::uint64_t sequence, std::uint64_t /*base*/) noexcept {
-    if (cursor >= out.size() || stream_id_ > wire::kMaxStream) return false;
-    out[cursor++] = wire::Control(kind, fields, wide);
-    if (!wire::Write<wire::StreamCodec>(stream_id_, out, cursor)) return false;
-    return wide ? wire::WriteU64(sequence, out, cursor)
-                : wire::Write<wire::SequenceCodec>(sequence, out, cursor);
-  }
   bool TimeAnchor(std::span<std::uint8_t> out, std::size_t& cursor,
                   std::uint64_t time) noexcept {
     return wire::Write<wire::TagCodec>(0, out, cursor) &&
-           wire::Write<wire::StreamCodec>(stream_id_, out, cursor) &&
            wire::WriteU64(time, out, cursor);
   }
 
   bool DrainMetricRetry(Entry& e) noexcept {
     if (!drain_) return false;
     auto const& m = e.retry;
-    bool wide = e.retry_sequence > wire::SequenceCodec::kUpper ||
-                m.count > wire::CountCodec::kUpper ||
-                m.samples > wire::CountCodec::kUpper ||
-                m.sum > wire::SumCodec::kUpper ||
-                m.min > wire::SumCodec::kUpper ||
-                m.max > wire::SumCodec::kUpper;
-    constexpr auto kMetricRecordCapacity =
-        1 + wire::StreamCodec::kMaxWireBytes + sizeof(std::uint64_t) +
-        wire::TagCodec::kMaxWireBytes + 5 * sizeof(std::uint64_t);
+    constexpr auto kMetricRecordCapacity = wire::kMaxBlockHeaderBytes +
+                                           wire::TagCodec::kMaxWireBytes +
+                                           5 * wire::MetricCodec::kMaxWireBytes;
     std::array<std::uint8_t, kMetricRecordCapacity> frame{};
-    std::size_t cursor = 0;
+    std::size_t cursor = wire::kMaxBlockHeaderBytes;
     if (!wire::Write<wire::TagCodec>(e.index, frame, cursor) ||
-        !Header(frame, cursor, wire::kMetricRecord, 0, wide, e.retry_sequence,
-                0))
+        !wire::Write<wire::CountCodec>(m.count, frame, cursor) ||
+        !wire::Write<wire::CountCodec>(m.samples, frame, cursor) ||
+        !wire::Write<wire::SumCodec>(m.sum, frame, cursor) ||
+        !wire::Write<wire::SumCodec>(m.min, frame, cursor) ||
+        !wire::Write<wire::SumCodec>(m.max, frame, cursor))
       return false;
-    if (wide) {
-      for (auto n : {m.count, m.samples, m.sum, m.min, m.max})
-        if (!wire::WriteU64(n, frame, cursor)) return false;
-    } else if (!wire::Write<wire::CountCodec>(m.count, frame, cursor) ||
-               !wire::Write<wire::CountCodec>(m.samples, frame, cursor) ||
-               !wire::Write<wire::SumCodec>(m.sum, frame, cursor) ||
-               !wire::Write<wire::SumCodec>(m.min, frame, cursor) ||
-               !wire::Write<wire::SumCodec>(m.max, frame, cursor))
+    std::array<std::uint8_t, wire::kMaxBlockHeaderBytes> header{};
+    std::size_t header_size = 0;
+    if (!wire::WriteBlockHeader(header, header_size, wire::kMetricRecord, 0,
+                                stream_id_, cursor - wire::kMaxBlockHeaderBytes,
+                                1))
       return false;
-    auto const record = std::span<std::uint8_t const>{frame}.first(cursor);
-    if (record.empty()) return false;
+    auto const begin = wire::kMaxBlockHeaderBytes - header_size;
+    std::memcpy(frame.data() + begin, header.data(), header_size);
+    auto const record =
+        std::span<std::uint8_t const>{frame}.subspan(begin, cursor - begin);
 #if defined(__cpp_exceptions) || defined(__EXCEPTIONS) || defined(_CPPUNWIND)
     try {
 #endif
@@ -392,6 +388,7 @@ class Stream {
     }
 #endif
     used_ = 0;
+    records_ = 0;
     frozen_ = false;
     return true;
   }
@@ -401,16 +398,19 @@ class Stream {
   void* drain_context_;
   ConsoleCallback console_;
   void* console_context_;
-  std::array<std::uint8_t, Capacity> bytes_{};
-  std::array<std::uint8_t, Capacity + 16> scratch_{};
+  // A fixed prefix keeps duration ticket addresses stable while the packed
+  // block header changes size. No body shifting and no additional RAM arena.
+  mutable std::array<std::uint8_t, Capacity + wire::kMaxBlockHeaderBytes>
+      bytes_{};
+  std::array<std::uint8_t, Capacity + wire::kMaxBlockHeaderBytes> scratch_{};
   std::array<Entry, MetricCapacity> metrics_{};
   std::size_t used_{};
-  std::uint64_t sequence_{}, dropped_{}, metric_overflow_{},
+  std::uint64_t records_{}, base_time_{}, dropped_{}, metric_overflow_{},
       console_failures_{};
   std::uint64_t generation_{1}, last_time_{}, time_epoch_{};
   bool time_valid_{};
-  bool busy_{}, sequence_exhausted_{}, restore_closed_{}, frozen_{},
-      slots_disabled_{};
+  std::uint32_t pending_fields_{};
+  bool busy_{}, restore_closed_{}, frozen_{}, slots_disabled_{};
 };
 }  // namespace ae::tele::raw
 #endif

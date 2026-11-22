@@ -81,16 +81,11 @@ inline void test_codec_tier_boundaries_and_atomic_partial_io() {
   CheckCases<wire::StreamCodec>(std::array{Case{0, 1}, Case{15, 1}, Case{16, 2},
                                            Case{1023, 2}, Case{1024, 4},
                                            Case{65535, 4}});
-  CheckCases<wire::SequenceCodec>(std::array{
-      Case{0, 2}, Case{32767, 2}, Case{32768, 4}, Case{2'000'000'000, 4},
-      Case{2'000'000'001, 8}, Case{wire::Limit<wire::SequenceCodec>(), 8}});
-  CheckCases<wire::SumCodec>(std::array{
-      Case{0, 2}, Case{32767, 2}, Case{32768, 4}, Case{2'000'000'000, 4},
-      Case{2'000'000'001, 8}, Case{wire::Limit<wire::SumCodec>(), 8}});
-  CheckCases<wire::CountCodec>(
-      std::array{Case{0, 1}, Case{247, 1}, Case{248, 2}, Case{2047, 2},
-                 Case{2048, 4}, Case{16'000'000, 4}, Case{16'000'001, 8},
-                 Case{wire::Limit<wire::CountCodec>(), 8}});
+  static_assert(std::is_same_v<wire::CountCodec, wire::SumCodec>);
+  CheckCases<wire::MetricCodec>(
+      std::array{Case{0, 1}, Case{200, 1}, Case{201, 2}, Case{5000, 2},
+                 Case{5001, 4}, Case{100'000'000, 4}, Case{100'000'001, 8},
+                 Case{wire::Limit<wire::MetricCodec>(), 8}});
   CheckCases<wire::BlobCodec>(std::array{
       Case{0, 1}, Case{250, 1}, Case{251, 2}, Case{1500, 2}, Case{1501, 4},
       Case{1'967'580, 4}, Case{wire::Limit<wire::BlobCodec>(), 4}});
@@ -145,7 +140,6 @@ void CheckMalformedLogicalValue(std::uint64_t invalid) {
 inline void test_codec_rejects_overflow_and_invalid_logical_values() {
   CheckOutOfRange<wire::TagCodec>();
   CheckOutOfRange<wire::StreamCodec>();
-  CheckOutOfRange<wire::SequenceCodec>();
   CheckOutOfRange<wire::CountCodec>();
   CheckOutOfRange<wire::SumCodec>();
   CheckOutOfRange<wire::BlobCodec>();
@@ -157,7 +151,7 @@ inline void test_codec_rejects_overflow_and_invalid_logical_values() {
   CheckMalformedLogicalValue<wire::DurationCodec>(254);
 }
 
-inline void test_wide_u64_keeps_full_range_and_partial_io_atomic() {
+inline void test_absolute_time_u64_keeps_full_range_and_partial_io_atomic() {
   for (auto number : {std::uint64_t{0}, std::uint64_t{1},
                       std::numeric_limits<std::uint64_t>::max()}) {
     std::array<std::uint8_t, 16> bytes;
@@ -283,7 +277,7 @@ inline void test_duration_nearest_values_and_explicit_range_states() {
 inline void Run() {
   RUN_TEST(test_codec_tier_boundaries_and_atomic_partial_io);
   RUN_TEST(test_codec_rejects_overflow_and_invalid_logical_values);
-  RUN_TEST(test_wide_u64_keeps_full_range_and_partial_io_atomic);
+  RUN_TEST(test_absolute_time_u64_keeps_full_range_and_partial_io_atomic);
   RUN_TEST(test_time_codes_floor_without_overshoot);
   RUN_TEST(test_duration_nearest_values_and_explicit_range_states);
 }

@@ -36,6 +36,7 @@ struct DecodedRecord {
   std::uint32_t index{};
   std::uint32_t stream{};
   std::uint32_t fields{};
+  // Decoder-derived append ordinal for source compatibility; never on the wire.
   std::uint64_t sequence{};
   Kind kind{};
   std::optional<std::uint64_t> time;
@@ -55,13 +56,15 @@ struct DecodeResult {
   std::size_t error_offset{};
 };
 
-// State belongs to the byte stream, not to a drain callback or a RAM batch.
+// Each block is self-contained. State only supplies derived per-writer append
+// ordinals across successive calls; timestamps restart from each writer header.
 struct DecodeState {
-  std::map<std::uint32_t, std::uint64_t> time;
+  std::map<std::uint32_t, std::uint64_t> time, ordinal;
 };
 inline DecodeResult Decode(std::span<std::uint8_t const> input,
                            DecodeState& state) {
   DecodeResult result;
+  auto next = state;
   std::size_t cursor = 0;
   auto packed = [&]<typename Codec>(std::uint64_t& value) {
     return wire::Read<Codec>(input, cursor, value) == wire::ReadStatus::kOk;
@@ -74,74 +77,106 @@ inline DecodeResult Decode(std::span<std::uint8_t const> input,
     return result;
   };
   while (cursor < input.size()) {
+    auto const block_start = cursor;
     result.error_offset = cursor;
-    std::uint64_t index{}, stream{};
-    if (!packed.template operator()<wire::TagCodec>(index)) return fail();
-    if (index == 0) {
-      std::uint64_t absolute{};
-      if (!packed.template operator()<wire::StreamCodec>(stream) ||
-          !u64(absolute))
-        return fail();
-      state.time[static_cast<std::uint32_t>(stream)] = absolute;
-      result.valid_bytes = cursor;
-      continue;
-    }
-    if (cursor == input.size()) return fail();
-    auto const control = input[cursor++];
-    if (!wire::ValidControl(control)) return fail();
-    bool const wide = (control & wire::kWide) != 0;
-    DecodedRecord record;
-    record.index = static_cast<std::uint32_t>(index);
-    record.fields = wire::Fields(control);
-    record.kind = (control & 3) == 0 ? Kind::kLog : Kind::kMetric;
-    if (!packed.template operator()<wire::StreamCodec>(stream)) return fail();
-    record.stream = static_cast<std::uint32_t>(stream);
-    if (!(wide ? u64(record.sequence)
-               : packed.template operator()<wire::SequenceCodec>(
-                     record.sequence)))
+    auto const kind = input[cursor++];
+    if (kind > wire::kMetricRecord) return fail();
+    std::uint64_t writers{};
+    if (!packed.template operator()<wire::StreamCodec>(writers) || !writers ||
+        writers > input.size() - cursor)
       return fail();
-    if (record.kind == Kind::kMetric) {
-      Metric m;
-      bool ok =
-          wide ? u64(m.count) && u64(m.samples) && u64(m.sum) && u64(m.min) &&
-                     u64(m.max)
-               : packed.template operator()<wire::CountCodec>(m.count) &&
-                     packed.template operator()<wire::CountCodec>(m.samples) &&
-                     packed.template operator()<wire::SumCodec>(m.sum) &&
-                     packed.template operator()<wire::SumCodec>(m.min) &&
-                     packed.template operator()<wire::SumCodec>(m.max);
-      if (!ok) return fail();
-      record.metric = m;
-    } else {
-      if (record.fields & kTime) {
-        std::uint64_t delta{};
-        auto found = state.time.find(record.stream);
-        if (found == state.time.end() ||
-            !packed.template operator()<wire::TimeCodec>(delta))
-          return fail();
-        found->second += wire::TimeValue(static_cast<std::uint16_t>(delta));
-        record.time = found->second;
-      }
-      if (record.fields & kDuration) {
-        if (cursor == input.size()) return fail();
-        record.duration_code = input[cursor++];
-        auto duration = wire::DecodeDuration(record.duration_code);
-        record.duration_state = duration.state;
-        if (duration.known()) record.duration = duration.microseconds;
-      }
-      if (record.fields & kPayload) {
-        std::uint64_t length{};
-        if (!packed.template operator()<wire::BlobCodec>(length) ||
-            length > input.size() - cursor)
-          return fail();
-        record.payload =
-            input.subspan(cursor, static_cast<std::size_t>(length));
-        cursor += static_cast<std::size_t>(length);
-      }
+    std::uint32_t fields = 0;
+    if (kind == wire::kLogRecord) {
+      if (cursor == input.size()) return fail();
+      fields = input[cursor++];
+      if (fields & ~kAllFields) return fail();
     }
-    result.records.push_back(record);
+    std::vector<std::uint32_t> seen;
+    for (std::uint64_t writer = 0; writer < writers; ++writer) {
+      std::uint64_t stream{}, bytes{}, count{}, time{};
+      if (!packed.template operator()<wire::StreamCodec>(stream) ||
+          !packed.template operator()<wire::BlobCodec>(bytes) ||
+          !packed.template operator()<wire::MetricCodec>(count) || !bytes ||
+          !count || count > bytes)
+        return fail();
+      auto const id = static_cast<std::uint32_t>(stream);
+      if (std::find(seen.begin(), seen.end(), id) != seen.end()) return fail();
+      seen.push_back(id);
+      if ((fields & kTime) && !u64(time)) return fail();
+      if (bytes > input.size() - cursor) return fail();
+      auto const end = cursor + static_cast<std::size_t>(bytes);
+      // Restrict every read to this writer body: malformed lengths cannot
+      // consume bytes from a following writer or telemetry block.
+      auto body_packed = [&]<typename Codec>(std::uint64_t& value) {
+        return wire::Read<Codec>(input.first(end), cursor, value) ==
+               wire::ReadStatus::kOk;
+      };
+      for (std::uint64_t item = 0; item < count;) {
+        result.error_offset = cursor;
+        std::uint64_t index{};
+        if (!body_packed.template operator()<wire::TagCodec>(index))
+          return fail();
+        if (!index) {
+          if (!(fields & kTime) ||
+              wire::ReadU64(input.first(end), cursor, time) !=
+                  wire::ReadStatus::kOk ||
+              cursor == end)
+            return fail();
+          continue;
+        }
+        DecodedRecord record;
+        record.index = static_cast<std::uint32_t>(index);
+        record.stream = id;
+        record.fields = fields;
+        record.kind = kind == wire::kLogRecord ? Kind::kLog : Kind::kMetric;
+        record.sequence = next.ordinal[id]++;
+        if (record.kind == Kind::kMetric) {
+          Metric m;
+          if (!body_packed.template operator()<wire::MetricCodec>(m.count) ||
+              !body_packed.template operator()<wire::MetricCodec>(m.samples) ||
+              !body_packed.template operator()<wire::MetricCodec>(m.sum) ||
+              !body_packed.template operator()<wire::MetricCodec>(m.min) ||
+              !body_packed.template operator()<wire::MetricCodec>(m.max) ||
+              (m.samples && m.min > m.max))
+            return fail();
+          record.metric = m;
+        } else {
+          if (fields & kTime) {
+            std::uint64_t code{};
+            if (!body_packed.template operator()<wire::TimeCodec>(code))
+              return fail();
+            auto delta = wire::TimeValue(static_cast<std::uint16_t>(code));
+            if (delta > UINT64_MAX - time) return fail();
+            time += delta;
+            record.time = time;
+          }
+          if (fields & kDuration) {
+            if (cursor == end) return fail();
+            record.duration_code = input[cursor++];
+            auto duration = wire::DecodeDuration(record.duration_code);
+            record.duration_state = duration.state;
+            if (duration.known()) record.duration = duration.microseconds;
+          }
+          if (fields & kPayload) {
+            std::uint64_t length{};
+            if (!body_packed.template operator()<wire::BlobCodec>(length) ||
+                length > end - cursor)
+              return fail();
+            record.payload =
+                input.subspan(cursor, static_cast<std::size_t>(length));
+            cursor += static_cast<std::size_t>(length);
+          }
+        }
+        result.records.push_back(record);
+        ++item;
+      }
+      if (cursor != end) return fail();
+      if (fields & kTime) next.time[id] = time;
+    }
     result.valid_bytes = cursor;
+    result.error_offset = block_start;
   }
+  state = std::move(next);
   result.error_offset = cursor;
   return result;
 }
@@ -157,7 +192,7 @@ struct Reconstruction {
 };
 
 // Input captures must be supplied in append order, without overlapping bytes.
-// Preserve that order for each writer, including sequence resets after restart,
+// Preserve physical append order for each writer across process restarts,
 // then merge available writer heads by time. Ordinary timestamped lifecycle
 // events provide context; no special restart identifier or marker is required.
 // Without timestamps only per-writer order is known; tie order is
@@ -179,7 +214,6 @@ inline Reconstruction Reconstruct(std::vector<DecodedRecord> const& input) {
     for (std::size_t i = 1; i < records.size(); ++i) {
       auto const& previous = records[i - 1];
       auto const& current = records[i];
-      if (current.sequence <= previous.sequence) result.sequence_reset = true;
       if (previous.time && current.time && *current.time < *previous.time)
         result.clock_regressed = true;
     }
@@ -213,8 +247,8 @@ inline std::vector<DecodedRecord> MergeRecords(
 }
 
 // Metric frames carry disjoint acknowledged deltas, not cumulative snapshots.
-// Supply every persisted byte exactly once. Sequence numbers can reset, so they
-// are not persistent identities and cannot be used to deduplicate captures.
+// Supply every persisted byte exactly once. There is no on-wire
+// sequence number and repeated input ranges cannot be deduplicated.
 inline std::map<std::uint32_t, Metric> RestoreMetrics(
     std::vector<DecodedRecord> const& records) {
   std::map<std::uint32_t, Metric> result;
@@ -233,8 +267,7 @@ inline Metric RestoreMetric(std::vector<DecodedRecord> const& records,
 }
 
 inline void PrintRecord(std::ostream& out, DecodedRecord const& record) {
-  out << "stream=" << record.stream << " sequence=" << record.sequence
-      << " index=" << record.index;
+  out << "stream=" << record.stream << " index=" << record.index;
   if (record.time) out << " time_us=" << *record.time;
   if (record.duration)
     out << " duration_us=" << *record.duration;
