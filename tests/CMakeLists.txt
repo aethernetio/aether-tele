@@ -52,6 +52,9 @@ target_include_directories(test-raw-tele PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-raw-tele PRIVATE aether::tele_raw unity Threads::Threads)
 target_compile_definitions(test-raw-tele PRIVATE AE_TELE_RAW_DEBUG=1 AE_TELE_TEST_NATIVE_FILE=0)
 add_test(NAME test-raw-tele COMMAND test-raw-tele)
+add_executable(test-block-format raw/block_format.cpp)
+target_link_libraries(test-block-format PRIVATE aether::tele_raw unity)
+add_test(NAME test-block-format COMMAND test-block-format)
 add_executable(test-raw-reindexed raw/flat.cpp raw/flat_healthy.cpp)
 target_include_directories(test-raw-reindexed PRIVATE ${PROJECT_SOURCE_DIR}/src)
 target_link_libraries(test-raw-reindexed PRIVATE aether::tele_raw unity Threads::Threads)
@@ -83,6 +86,9 @@ if(AE_TELE_BUILD_FILE_DRAIN)
   target_link_libraries(test-file-backend PRIVATE aether::tele_file unity)
   add_test(NAME test-file-backend COMMAND test-file-backend)
   set_tests_properties(test-file-backend PROPERTIES TIMEOUT 60)
+  add_executable(test-threaded-restart raw/threaded_restart.cpp)
+  target_link_libraries(test-threaded-restart PRIVATE aether::tele_file Threads::Threads)
+  target_compile_definitions(test-threaded-restart PRIVATE AE_TELE_RAW_DEBUG=1)
 endif()
 set(AE_TELE_AETHER_SOURCE "" CACHE PATH "Optional Aether checkout for real telemetry API compatibility tests")
 if(AE_TELE_AETHER_SOURCE)
@@ -108,6 +114,12 @@ if(AE_TELE_RAW_TSAN AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_FOUND)
+  if(TARGET test-threaded-restart)
+    add_test(NAME test-threaded-restart COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/raw/threaded_restart.py
+      --exe $<TARGET_FILE:test-threaded-restart>)
+    set_tests_properties(test-threaded-restart PROPERTIES TIMEOUT 120)
+  endif()
   if(TARGET test-file-drain)
     add_test(NAME test-file-drain-restart COMMAND ${Python3_EXECUTABLE}
       ${CMAKE_CURRENT_SOURCE_DIR}/raw/compact_restart.py
@@ -116,6 +128,8 @@ if(Python3_FOUND)
   endif()
   add_test(NAME test-raw-decoder-regressions COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/raw/compact_decoder_test.py)
+  add_test(NAME test-raw-analysis COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/raw/analysis_test.py)
   add_test(NAME test-raw-maps COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/raw/compact_maps.py
     --exe $<TARGET_FILE:test-raw-tele>

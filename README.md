@@ -24,7 +24,7 @@ and choose how it reaches a file, flash or another destination.
 - **Statistics that continue after restart.** Restore totals from acknowledged
   metric batches before recording, then accumulate new contributions without
   sending the restored history again. A stop event is unnecessary. Raw records
-  continue across drains and restarts without block headers or format versions.
+  continue across drains and restarts in self-contained writer blocks.
   This implementation assumes normal, complete writes; interrupted-file recovery
   is outside its scope. Unacknowledged RAM changes are not durable.
 
@@ -53,7 +53,7 @@ of all console-related code from the binary.
 
 Each `Space<Identity, compiled_options, Clock>` has an independent runtime mask.
 Each writer owns a `Stream<Space>`:
-its fixed RAM arena, metrics, sequence and callbacks. The stream must not be
+its fixed RAM arena, metrics and callbacks. The stream must not be
 copied, shared between writers, or destroyed while a scope still references it.
 Different streams may share a space; `SetRuntime` publishes one atomic options
 snapshot to concurrent writers. Use distinct stream numbers for live writers.
@@ -164,39 +164,40 @@ barrier required by the destination (a stream flush alone is not a power-loss
 guarantee). Different writer callbacks sharing a file must serialize complete
 batches. Never interleave bytes from two callbacks.
 
-Records concatenate directly in a file/flash region. Drain boundaries do not
-appear on the wire. Tag index **0** is reserved: its packed writer ID and
-absolute `uint64` microsecond timestamp reset that writer's time base. It is
-inserted before the first timed record, after a runtime configuration change,
-and when time regresses or exceeds the exponential delta range. A normal
-restart starts a new writer stream and emits this anchor; it does not need to
-load the previous log line. Counter totals are restored separately.
+Complete telemetry blocks concatenate directly in a file/flash region. A block
+contains its kind (logs or metrics) and writer count. Each writer section has
+one ID, body byte length and record count. Log layout is shared by the block,
+with an absolute timestamp base per timed writer section. Individual logs have
+only their tag and configured data: **no control byte, writer ID, sequence or
+wide flag**. Tag zero inside a timed writer section resets that writer's time
+base, followed by an absolute u64 timestamp; it never repeats the writer ID.
+Every drain is independently decodable, without loading a previous log line.
 
-Each normal record carries its own tag, control/field mask, writer and sequence.
-Deltas are relative to the previous **decoded** timestamp of that writer, across
-any number of drains. `DecodeState` allows successive byte chunks to be decoded
-with the same state. A complete concatenated stream can be decoded in one call.
-There is no block length, block header, magic, checksum or format version.
+A `Stream` owns one writer, so its synchronous callback emits a block with
+writer count one. `wire::WriteBlockPrefix` and `WriteWriterHeader` also support
+multi-writer blocks; both decoders validate and read these. Sharing a file does
+not require waiting for other writers before acknowledging one writer's batch.
+The block log-field layout is described once in its header, also documented by
+the build map. Compile-time configuration limits available fields. The existing
+optional runtime field controls remain supported: changing layout finishes the
+old block instead of adding masks to every record. Open scopes keep their
+original field snapshots, and drained durations stay explicitly unknown.
 
-Start, stop, pause and resume are ordinary application-defined tags, recorded
-with `kTime` enabled. There are no reserved lifecycle indices or special
-lifecycle record kinds. A missing stop marker does not prevent reading or
-appending after an abrupt exit. Pause/resume boundaries are inferred from
-their ordinary events; the application controls collection with `SetRuntime`.
+Start, stop, pause and resume remain ordinary application-defined tags.
+A missing stop marker does not prevent reading or appending after an abrupt
+exit. `Reconstruct` preserves each writer's physical append order across process
+restarts and then merges available writer heads by timestamp. There is no
+persisted sequence number. The C++ `DecodedRecord::sequence` member is retained
+only as a decoder-derived append ordinal for source compatibility, and is not
+printed or serialized. Supply capture files in append order. Without timestamps
+only per-writer append order is known; equal timestamps do not establish
+cross-thread causality. Repeated input ranges are not deduplicated. Returned
+record views borrow the input bytes.
 
-Writer sequences may restart at zero after reopening. `Reconstruct` preserves
-each writer's physical append order, including counter resets, then merges
-available writer heads by timestamp. Supply capture files in append order.
-Counter resets and clock regressions are diagnostics, not errors. Without
-timestamps only per-writer append order is known. Cross-thread causality cannot
-be inferred from equal/disabled timestamps. The returned views borrow the input
-file bytes. Supply each persisted byte range exactly once: repeated counters
-are legitimate after restarting, so replaying the same file twice cannot be
-unambiguously distinguished from genuine data and is not deduplicated.
 `DrainMetrics()` first drains logs, then writes incremental flat metric batches
 even when logs are compiled/runtime-disabled. RAM `MetricFor()` totals are not
 reset, but only not-yet-acknowledged contributions are sent. A repeated drain
-without updates emits nothing. A failed batch keeps identical bytes and sequence
+without updates emits nothing. A failed batch keeps identical block bytes
 for retry; updates made after failure are queued separately until that retry is
 acknowledged. `RestoreMetrics` sums accepted batches from all writers and across
 restarts without reconstructing process boundaries or depending on stop markers.
@@ -285,7 +286,61 @@ Callbacks are synchronous; stop their writers before closing the file.
 This component may allocate and block during filesystem IO. It is separate from
 the allocation-free raw core and can be omitted with
 `-DAE_TELE_BUILD_FILE_DRAIN=OFF` (the default for cross/embedded builds).
-No file metadata, sessions, checksums or alternate record formats are added.
+No sessions, checksums or additional file envelope is added.
+
+## Multithreaded process restart test and byte analysis
+
+The host fixture `test-threaded-restart` uses one raw `Stream` per worker and
+one shared durable `FileDrain`. Its Python driver starts **five separate
+application processes**, each with four concurrent workers writing 1000 scoped
+logs to the same append-only capture. Worker creation order changes between
+boots; logical writer IDs 1..4 remain stable. Both runtime and native thread IDs,
+process IDs and restored counts are included in the report. Each restart checks
+the old file prefix, log payloads/order, exact per-writer and
+combined metrics, and that restoring/draining history does not write it again.
+One boot exits with `_Exit` after successful checkpoints, without destructors or
+an application stop marker. This tests acknowledged writes, not termination
+during a write or recovery of unacknowledged RAM.
+
+From a native checkout (append `.exe` on Windows; multi-configuration generators
+also put the binary under `Release/`):
+
+```text
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DAE_TELE_BUILD_TESTS=ON -DAE_TELE_INSTALL=OFF
+cmake --build build --config Release --target test-threaded-restart
+python tests/raw/threaded_restart.py --exe build/tests/test-threaded-restart --output-dir restart-results
+python tools/analyze_raw.py restart-results/capture.raw --map restart-results/map.json --records restart-results/decoded.jsonl --output restart-results/summary.json
+```
+
+`--output-dir` must name a new directory; omitting it uses temporary files.
+The driver accepts `--boots`, `--workers`, `--events` and `--payload-bytes`.
+It also runs through CTest as `test-threaded-restart` when Python and the native
+file target are enabled. Golden byte-accounting tests run as `test-raw-analysis`.
+
+The deterministic workload advances timestamps by 1000 us per log and scope
+durations by 5 us. It measures encoded size, not real-world event timing or IO
+throughput. With defaults it writes 20,000 logs and restores count/samples 20,000,
+sum 100,000 us, min/max 5 us. Each log contains a 12-byte parameter blob:
+little-endian u32 boot, writer and item number.
+
+The analyzer decodes both log and metric blocks, emits optional JSONL in
+physical append order, and partitions every capture byte. It reports averages
+excluding only the **contents** of parameter blobs:
+
+- `average_log_bytes_excluding_payload`: record bodies only, including blob-length
+  prefixes. Defaults give **4 bytes/log**: tag 1 + time 1 + duration 1 + blob length 1.
+- `average_with_log_block_headers_excluding_payload`: also amortizes log-block
+  headers and any in-body time resets; defaults give **4.136 bytes/log**.
+- `average_capture_bytes_excluding_payload`: also amortizes metric blocks;
+  defaults give **4.232 bytes/log** with one checkpoint every 127 events plus
+  the final checkpoint.
+
+The default 20,000-log capture is 324,640 bytes, including 240,000 bytes of
+parameters, 80,000 bytes of log overhead, 2,720 bytes of log-block headers and
+1,920 bytes of metric blocks. These are decoded byte counts, not a fixed-size
+assumption. Wider tags, time deltas and blob lengths increase record size;
+writer ID width affects headers only. No-log captures return `null` averages.
+Build-map JSON and decoded JSONL are external artifacts, excluded from capture size.
 
 ## Debug maps and index reassignment
 
@@ -337,65 +392,84 @@ capture after upgrading from the experimental layout with those fields.
 
 ## Compact binary layout
 
-The wire codecs use the pinned `aethernet-numeric` revision
-`9d79bd79188420533bab07c437d617aedfaf6b1a`. Existing public packed integer
-aliases used by Aether's protocol are unchanged. Link `aether::tele_raw` for the
-raw headers and numeric include requirements.
+The wire codecs use the pinned `aethernet-numeric` revision from CMake.
+Link `aether::tele_raw` for raw headers and numeric include requirements.
+The **thread_blocks** format replaces the experimental flat-record layout;
+use a new capture and its matching map. Old maps are rejected, and old capture
+bytes must not be appended to a new capture.
 
-The stream has two record shapes (little endian):
+All integers are little endian. A telemetry block is:
 
 ```text
-0   | writer:StreamCodec | absolute_time_us:u64
-TAG | control:u8 | writer:StreamCodec | sequence:SequenceCodec-or-u64 | fields...
+kind:u8 | writer_count:StreamCodec | log_fields:u8 (logs only)
+  repeated writer_count times:
+    writer:StreamCodec | body_bytes:BlobCodec | records:MetricCodec
+    base_time_us:u64 (timed logs only)
+    body[body_bytes]
 ```
 
-TAG is 1..65535. Low control bits select a log (0) or metric (1); field bits
-are shifted left by two; bit 7 selects exact wide u64 values. Log fields, when
-selected, are time delta, one duration byte, blob length and blob bytes. A metric
-record carries count, samples, sum, min and max instead. Each record is complete;
-there is no outer size prefix or block envelope. Blob lengths still use
-`TieredInt<uint8_t,250,1500>` (1, 2 or 4 bytes).
+Each block must have at least one writer, every writer ID must be unique within
+that block, and each nonempty body must match its declared byte length and
+record count. Record counts exclude in-body absolute-time reset commands.
+Both readers reject malformed/truncated bodies and cross-writer length overruns.
+No magic, build hash, checksum or on-wire format version is added.
+
+```text
+log record:    TAG | time_delta? | duration:u8? | blob_length? | blob_bytes?
+metric record: TAG | count:MetricCodec | samples:MetricCodec
+                  | sum_us:MetricCodec | min_us:MetricCodec | max_us:MetricCodec
+absolute time: 0   | absolute_time_us:u64     (timed log bodies only)
+```
+
+Every metric value independently uses
+`TieredInt<uint8_t, 200, 5000, 100000000>`:
+
+| Value | Bytes |
+|---|---:|
+| 0..200 | 1 |
+| 201..5,000 | 2 |
+| 5,001..100,000,000 | 4 |
+| 100,000,001..2,182,612,529,211,367,680 | 8 |
+
+There is no wide fallback. RAM statistics, accepted-history aggregation and
+outgoing deltas saturate at `raw::kMetricMax`, the codec's upper bound. Startup
+restoration atomically rejects values above that bound. Timestamps remain u64.
 
 Time uses `Exponential<FixedPoint<uint32_t,64.0>, TimeCodec, 1e-6,60.0,511>`.
-Code 0 represents zero delta. The encoder chooses the greatest reconstructed
-value no larger than the actual delta from the **previous reconstructed time**;
-rounding errors therefore do not accumulate across many events. Deltas through
-6535 microseconds fit one byte, larger deltas through 60 seconds use two.
+The encoder chooses a value no larger than the delta from the previous decoded
+time; rounding errors do not accumulate across events. Deltas through 6535 us
+fit one byte, larger deltas through 60 seconds use two. A time regression,
+runtime epoch change or larger gap emits an in-body absolute-time reset.
 
-Duration uses the same fixed-point runtime and exponential range with 253
-numeric codes. Encoding selects the nearest decoded microsecond value. Its
-maximum relative error for integer-microsecond input in this range is about
-5.56%; endpoints are exact. Bounds are checked before quantization:
+Duration uses the same fixed-point/exponential range with 253 numeric codes.
+The encoder selects the nearest decoded value. Its maximum relative error for
+integer-microsecond input is about 5.56%; endpoints are exact.
 
 | Duration byte | Meaning |
 |---:|---|
-| 0 | below 1 microsecond; exact duration unspecified |
-| 1 | 1 microsecond |
-| 2..252 | approximate exponential duration |
-| 253 | 60 seconds |
-| 254 | above 60 seconds; exact duration unspecified |
-| 255 | unknown/uninitialized, including a scope still open when drained |
+| 0 | below 1 us |
+| 1 | exactly 1 us |
+| 2..252 | approximate duration |
+| 253 | exactly 60 seconds |
+| 254 | above 60 seconds |
+| 255 | unknown, including a scope still open when drained |
 
-Exact time/duration lookup tables are exported in each debug map. Python uses
-those tables, including numeric's fixed-point rounding, instead of recreating
-them with floating-point math.
+Exact time/duration tables are exported in the debug map. For one-byte tags,
+time deltas and blob lengths, record overhead excluding parameter contents is:
 
-For a one-byte tag/writer and a two-byte sequence, ordinary records occupy:
-
-| Enabled fields | Bytes, RAM and file |
+| Fields | Bytes/log, excluding block headers |
 |---|---:|
-| tag and record context | 5 |
-| plus time | 6..7 |
-| plus duration | 6 |
-| plus time and duration | 7..8 |
-| plus time, duration and N blob bytes | N+8..12 |
+| Tag only | 1 |
+| Time | 2 |
+| Time + duration | 3 |
+| Time + duration + parameter-length prefix | 4 |
 
-An absolute-time command occupies 10..13 bytes, depending on writer width.
-It is not repeated at a drain boundary. Wider tag/writer/sequence encodings add
-their own bytes. Metric values remain exact integers, with a wide u64 fallback.
-The raw stream owns a Capacity-byte pending arena, a Capacity+16 scratch arena,
-a fixed metric table and control state. Duration tickets address RAM offsets;
-draining invalidates them without generating a scope-completion record.
+The stream owns a Capacity-byte body arena with a fixed 32-byte reserved header
+prefix, a Capacity+32 scratch arena and its metric table. No heap allocation is
+introduced in the raw core. Header widths can grow without moving body bytes or
+invalidating live duration tickets. Each drain freezes the full block and
+invalidates tickets, including on failure; successful retries cannot patch
+already acknowledged bytes. Capacity must fit the BlobCodec body-length range.
 
 ## Existing Aether API
 

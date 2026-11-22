@@ -28,11 +28,10 @@ struct Output {
   }
 };
 std::uint64_t FirstTag(std::span<std::uint8_t const> bytes) {
-  std::size_t cursor = 0;
-  std::uint64_t index = 0;
-  TEST_ASSERT_TRUE(wire::Read<wire::TagCodec>(bytes, cursor, index) ==
-                   wire::ReadStatus::kOk);
-  return index;
+  auto decoded = Decode(bytes);
+  TEST_ASSERT_TRUE(decoded.status == DecodeStatus::kOk);
+  TEST_ASSERT_FALSE(decoded.records.empty());
+  return decoded.records.front().index;
 }
 void test_flat_anchor_and_continuous_drain() {
   TestSpace space;

@@ -10,7 +10,7 @@ with tempfile.TemporaryDirectory() as tmp:
   m=Path(tmp)/f'{n}.json';f=Path(tmp)/f'{n}.raw'
   subprocess.run([exe,'--map',str(m)],check=True);subprocess.run([exe,'--fixture',str(f)],check=True)
   meta=load_map(m);rows,used,truncated=decode(f.read_bytes(),meta)
-  assert meta['layout']=='flat_records' and meta['absolute_time_tag']==0
+  assert meta['layout']=='thread_blocks' and meta['absolute_time_tag']==0
   assert len(rows)==2 and not truncated and used==f.stat().st_size
   assert rows[0]['time_us']==1000 and rows[0]['duration_us']==1
   assert rows[1]['metric']['count']==1

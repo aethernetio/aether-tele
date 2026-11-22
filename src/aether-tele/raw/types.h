@@ -21,8 +21,9 @@ enum Field : std::uint32_t {
 };
 // Removed bits are invalid; never reinterpret an old capture's fields.
 inline constexpr std::uint32_t kAllFields = kTime | kDuration | kPayload;
-// Minimum ordinary record: tag, control, writer, sequence.
-inline constexpr std::size_t kHeaderSize = 5;
+// Minimum record is its tag. Writer IDs and layout live in block headers.
+inline constexpr std::size_t kHeaderSize = 1;
+inline constexpr std::uint64_t kMetricMax = 2'182'612'529'211'367'680ULL;
 
 enum class Kind : std::uint32_t { kLog, kMetric };
 
@@ -137,7 +138,7 @@ struct MetricTotal {
 };
 inline void AccumulateMetric(Metric& target, Metric const& source) noexcept {
   auto add = [](std::uint64_t a, std::uint64_t b) {
-    auto const limit = std::numeric_limits<std::uint64_t>::max();
+    auto const limit = kMetricMax;
     return b > limit - a ? limit : a + b;
   };
   target.count = add(target.count, source.count);
